@@ -46,7 +46,9 @@ POLL_INTERVAL_SECONDS = int(_get_env("POLL_INTERVAL_SECONDS", required=False, de
 SQSTAT_BASE_URL = _get_env("SQSTAT_BASE_URL", required=False, default="https://breaking.proxy.sqstat.ru").rstrip("/")
 CLAN_ID = _get_env("CLAN_ID", required=False, default="127")
 # Фильтр по тегу клана в нике игрока (пусто = без фильтра, показывать всех)
-CLAN_TAG_FILTER = _get_env("CLAN_TAG_FILTER", required=False, default="TMNW")
+CLAN_TAG_FILTER = _get_env("CLAN_TAG_FILTER", required=False, default="apes")
+# Название клана для шапки/футера карточки
+CLAN_DISPLAY_NAME = _get_env("CLAN_DISPLAY_NAME", required=False, default="Apes")
 
 # Уведомление о конце засида — опционально
 _seed_channel = os.environ.get("SEED_ALERT_CHANNEL_ID")
@@ -107,24 +109,56 @@ SERVER_LABELS = {
 }
 
 
+_FONT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PREFERRED_FONT = os.path.join(_FONT_DIR, "NotoSans-Cyrillic.ttf")
+_font_cache: dict[int, ImageFont.FreeTypeFont] = {}
+
+
 def load_font(size: int):
-    """Загружает шрифт — ищет .ttf в текущей папке, иначе системный/дефолтный."""
-    for f in os.listdir("."):
-        if f.endswith(".ttf"):
-            try:
-                return ImageFont.truetype(f, size)
-            except Exception:
-                pass
-    for path in [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ]:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                pass
-    return ImageFont.load_default()
+    """
+    Шрифт с поддержкой кириллицы. Приоритет:
+    1. Забандленный NotoSans-Cyrillic.ttf рядом с bot.py (работает в любом окружении, включая Railway)
+    2. Любой другой .ttf рядом с bot.py
+    3. Системные шрифты (если вдруг есть)
+    4. Дефолтный PIL-шрифт (НЕ поддерживает кириллицу — крайний случай)
+    """
+    if size in _font_cache:
+        return _font_cache[size]
+
+    font = None
+    if os.path.exists(_PREFERRED_FONT):
+        try:
+            font = ImageFont.truetype(_PREFERRED_FONT, size)
+        except Exception as e:
+            log.warning(f"Не удалось загрузить {_PREFERRED_FONT}: {e}")
+
+    if font is None:
+        try:
+            for f in os.listdir(_FONT_DIR):
+                if f.endswith(".ttf"):
+                    font = ImageFont.truetype(os.path.join(_FONT_DIR, f), size)
+                    break
+        except Exception:
+            pass
+
+    if font is None:
+        for path in [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ]:
+            if os.path.exists(path):
+                try:
+                    font = ImageFont.truetype(path, size)
+                    break
+                except Exception:
+                    pass
+
+    if font is None:
+        log.warning("Кириллический шрифт не найден — текст на русском будет отображаться квадратиками!")
+        font = ImageFont.load_default()
+
+    _font_cache[size] = font
+    return font
 
 
 def load_flag(team_code: str, size: int):
@@ -184,8 +218,8 @@ def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
     # ── Шапка ──────────────────────────────────────
     draw.rectangle([0, 0, IMG_W, HEADER_H], fill=C_HEADER_BG)
     draw.rectangle([0, 0, 4, HEADER_H], fill=C_BORDER)
-    draw.text((PAD, 10), "Team NW", font=fn_title, fill=C_BORDER)
-    draw.text((PAD, 34), "В ИГРЕ // NIGHT WITCHES", font=fn_small, fill=C_GREY)
+    draw.text((PAD, 10), CLAN_DISPLAY_NAME, font=fn_title, fill=C_BORDER)
+    draw.text((PAD, 34), f"В ИГРЕ // {CLAN_DISPLAY_NAME.upper()}", font=fn_small, fill=C_GREY)
 
     dot_x = IMG_W - PAD - 8
     dot_y = 20
@@ -267,7 +301,7 @@ def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
     # ── Футер ──────────────────────────────────────
     footer_y = img_h - FOOTER_H
     draw.line([0, footer_y, IMG_W, footer_y], fill=(30, 30, 55), width=1)
-    draw.text((PAD, footer_y + 8), "NW Tracker", font=fn_small, fill=C_GREY)
+    draw.text((PAD, footer_y + 8), f"{CLAN_DISPLAY_NAME} Tracker", font=fn_small, fill=C_GREY)
     draw.text(
         (IMG_W - PAD - draw.textlength("made by stl", font=fn_small), footer_y + 8),
         "made by stl", font=fn_small, fill=(80, 80, 100),
