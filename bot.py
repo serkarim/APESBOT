@@ -47,6 +47,8 @@ SQSTAT_BASE_URL = _get_env("SQSTAT_BASE_URL", required=False, default="https://b
 CLAN_ID = _get_env("CLAN_ID", required=False, default="127")
 # Фильтр по тегу клана в нике игрока (пусто = без фильтра, показывать всех)
 CLAN_TAG_FILTER = _get_env("CLAN_TAG_FILTER", required=False, default="apes")
+# Поддержка нескольких тегов через запятую: "❀A❀,APES" -> совпадение хотя бы с одним
+CLAN_TAGS = [t.strip().upper() for t in CLAN_TAG_FILTER.split(",") if t.strip()]
 # Название клана для шапки/футера карточки
 CLAN_DISPLAY_NAME = _get_env("CLAN_DISPLAY_NAME", required=False, default="Apes")
 
@@ -396,6 +398,10 @@ async def fetch_online_data() -> dict | None:
             except Exception as e:
                 log.warning(f"public.php (карты/онлайн серверов): {e}")
 
+            raw_total = 0
+            matched_total = 0
+            seen_team_codes: set[str] = set()
+
             for srv_id, srv_data in clan_data.get("servers", {}).items():
                 if not srv_data or isinstance(srv_data, list):
                     continue
@@ -411,15 +417,25 @@ async def fetch_online_data() -> dict | None:
                     name = player_data.get("name", "").strip()
                     if not name or len(name) >= 50:
                         continue
-                    if CLAN_TAG_FILTER and CLAN_TAG_FILTER.upper() not in name.upper():
+                    raw_total += 1
+                    if CLAN_TAGS and not any(tag in name.upper() for tag in CLAN_TAGS):
                         continue
+                    matched_total += 1
+                    team_code = player_data.get("team", "")
+                    if team_code:
+                        seen_team_codes.add(str(team_code))
 
                     grouped.setdefault(srv_name, []).append({
                         "name": name,
-                        "team": player_data.get("team", ""),
+                        "team": team_code,
                         "cur_map": cur_map,
                         "srv_online": srv_online,
                     })
+
+            log.info(
+                f"sqstat: всего игроков на серверах {raw_total}, прошло фильтр тегов {matched_total}, "
+                f"коды фракций в текущей выдаче: {sorted(seen_team_codes)}"
+            )
 
     except Exception as e:
         log.error(f"fetch_online_data (sqstat scrape): {e}", exc_info=True)
@@ -559,6 +575,7 @@ async def start_online_loop():
 @bot.event
 async def on_ready():
     log.info(f"Бот запущен: {bot.user} ({bot.user.id})")
+    log.info(f"Фильтр тегов клана: {CLAN_TAGS}")
     asyncio.create_task(start_online_loop())
 
 
