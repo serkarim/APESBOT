@@ -1,0 +1,532 @@
+"""
+NW Discord Bot — модуль мониторинга онлайна.
+Каждые POLL_INTERVAL_SECONDS секунд запрашивает {API_BASE_URL}/nwst/api/online
+и публикует/обновляет PNG-карточку с текущим онлайном в указанном канале.
+
+Требования: discord.py, aiohttp, Pillow (см. requirements.txt)
+Все настройки — через переменные окружения (см. .env.example).
+"""
+
+import asyncio
+import io
+import json
+import logging
+import os
+import re
+from datetime import datetime, timedelta, timezone
+
+import aiohttp
+import discord
+from discord.ext import commands
+from PIL import Image, ImageDraw, ImageFont
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # локально подхватит .env; на Railway переменные и так в окружении
+except ImportError:
+    pass
+
+# ─────────────────────────────────────────────
+#  КОНФИГ — берём из переменных окружения
+# ─────────────────────────────────────────────
+
+
+def _get_env(name: str, required: bool = True, default: str | None = None) -> str | None:
+    val = os.environ.get(name, default)
+    if required and not val:
+        raise RuntimeError(f"Не задана обязательная переменная окружения: {name}")
+    return val
+
+
+DISCORD_TOKEN = _get_env("DISCORD_TOKEN")
+ONLINE_CHANNEL_ID = int(_get_env("ONLINE_CHANNEL_ID"))
+POLL_INTERVAL_SECONDS = int(_get_env("POLL_INTERVAL_SECONDS", required=False, default="120"))
+
+# Прямой парсинг sqstat — никакого стороннего API больше не нужно
+SQSTAT_BASE_URL = _get_env("SQSTAT_BASE_URL", required=False, default="https://breaking.proxy.sqstat.ru").rstrip("/")
+CLAN_ID = _get_env("CLAN_ID", required=False, default="127")
+# Фильтр по тегу клана в нике игрока (пусто = без фильтра, показывать всех)
+CLAN_TAG_FILTER = _get_env("CLAN_TAG_FILTER", required=False, default="TMNW")
+
+# Уведомление о конце засида — опционально
+_seed_channel = os.environ.get("SEED_ALERT_CHANNEL_ID")
+_seed_role = os.environ.get("SEED_ALERT_ROLE_ID")
+SEED_ALERT_CHANNEL_ID = int(_seed_channel) if _seed_channel else None
+SEED_ALERT_ROLE_ID = int(_seed_role) if _seed_role else None
+SEED_MAP_KEYWORDS = ["seed", "сид"]
+
+# Папка с флагами фракций: flags/afu.png, flags/rgf.png ...
+FLAGS_DIR = "flags"
+
+# ─────────────────────────────────────────────
+#  ЛОГИРОВАНИЕ
+# ─────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("nw-online-bot")
+
+# ─────────────────────────────────────────────
+#  БОТ
+# ─────────────────────────────────────────────
+
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ─────────────────────────────────────────────
+#  ГЕНЕРАЦИЯ PNG С ОНЛАЙНОМ
+# ─────────────────────────────────────────────
+
+# Цвета
+C_BG = (15, 15, 30)
+C_CARD = (22, 22, 45)
+C_BORDER = (0, 180, 140)
+C_HEADER_BG = (10, 10, 22)
+C_WHITE = (255, 255, 255)
+C_GREY = (160, 160, 180)
+C_GREEN = (0, 212, 140)
+C_RED_DOT = (220, 60, 60)
+
+# Размеры
+IMG_W = 700
+PAD = 24
+ROW_H = 36
+CARD_PAD = 14
+HEADER_H = 64
+FOOTER_H = 28
+FLAG_SIZE = 22
+
+SERVER_LABELS = {
+    "Invasion": "INVASION",
+    "AAS": "МИКС",
+    "Spec Ops": "SPEC OPS",
+    "Custom": "CUSTOM",
+}
+
+
+def load_font(size: int):
+    """Загружает шрифт — ищет .ttf в текущей папке, иначе системный/дефолтный."""
+    for f in os.listdir("."):
+        if f.endswith(".ttf"):
+            try:
+                return ImageFont.truetype(f, size)
+            except Exception:
+                pass
+    for path in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def load_flag(team_code: str, size: int):
+    variants = [f"{team_code}.png", f"{team_code.lower()}.png", f"{team_code.upper()}.png"]
+    for name in variants:
+        path = os.path.join(FLAGS_DIR, name)
+        if os.path.exists(path):
+            return Image.open(path).convert("RGBA").resize((size, size), Image.LANCZOS)
+    return None
+
+
+def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
+    """Генерирует PNG-карточку с онлайном клана."""
+    total = data.get("total_online", 0)
+    servers = data.get("servers", {})
+    now_msk = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M МСК")
+    game_state = game_state or {}
+
+    active_servers = []
+    for key, label in SERVER_LABELS.items():
+        srv = servers.get(key, {})
+        players = srv.get("players", []) if isinstance(srv, dict) else []
+        by_team = srv.get("by_team", {}) if isinstance(srv, dict) else {}
+        cur_map = players[0].get("cur_map", "") if players and isinstance(players[0], dict) else ""
+        srv_online = players[0].get("srv_online", 0) if players and isinstance(players[0], dict) else 0
+        if players:
+            active_servers.append((key, label, players, by_team, cur_map, srv_online))
+
+    total_players = sum(len(p) for _, _, p, _, _, _ in active_servers)
+    cards_count = len(active_servers) or 1
+    if not active_servers:
+        total_players = 1
+
+    map_game_extra = sum(
+        (18 if cur_map else 0) + (22 if game_state.get(key) else 0)
+        for key, _, _, _, cur_map, _ in active_servers
+    )
+
+    img_h = (
+        HEADER_H + PAD
+        + cards_count * (CARD_PAD * 2 + 28)
+        + total_players * ROW_H
+        + map_game_extra
+        + cards_count * PAD
+        + FOOTER_H + PAD
+    )
+
+    img = Image.new("RGB", (IMG_W, img_h), C_BG)
+    draw = ImageDraw.Draw(img)
+
+    fn_title = load_font(18)
+    fn_server = load_font(15)
+    fn_player = load_font(14)
+    fn_small = load_font(11)
+    fn_count = load_font(13)
+
+    # ── Шапка ──────────────────────────────────────
+    draw.rectangle([0, 0, IMG_W, HEADER_H], fill=C_HEADER_BG)
+    draw.rectangle([0, 0, 4, HEADER_H], fill=C_BORDER)
+    draw.text((PAD, 10), "Team NW", font=fn_title, fill=C_BORDER)
+    draw.text((PAD, 34), "В ИГРЕ // NIGHT WITCHES", font=fn_small, fill=C_GREY)
+
+    dot_x = IMG_W - PAD - 8
+    dot_y = 20
+    draw.ellipse([dot_x - 6, dot_y - 6, dot_x + 6, dot_y + 6], fill=C_GREEN if total > 0 else C_RED_DOT)
+    count_text = f"{total} бойцов онлайн"
+    bbox = draw.textbbox((0, 0), count_text, font=fn_count)
+    tw = bbox[2] - bbox[0]
+    draw.text((dot_x - 12 - tw, dot_y - 8), count_text, font=fn_count, fill=C_GREEN if total > 0 else C_GREY)
+    draw.text((IMG_W - PAD - draw.textlength(now_msk, font=fn_small), 40), now_msk, font=fn_small, fill=C_GREY)
+
+    # ── Карточки серверов ──────────────────────────
+    y = HEADER_H + PAD
+
+    if not active_servers:
+        draw.text((PAD, y + 10), "Никого нет в игре", font=fn_server, fill=C_GREY)
+    else:
+        for key, label, players, by_team, cur_map, srv_online in active_servers:
+            count = len(players)
+            game_extra = 22 if game_state.get(key) else 0
+            map_extra = 18 if cur_map else 0
+            card_h = CARD_PAD * 2 + 28 + count * ROW_H + game_extra + map_extra
+
+            draw.rectangle([PAD, y, IMG_W - PAD, y + card_h], fill=C_CARD)
+            draw.rectangle([PAD, y, PAD + 3, y + card_h], fill=C_BORDER)
+
+            draw.text((PAD + CARD_PAD, y + CARD_PAD), label, font=fn_server, fill=C_WHITE)
+            clan_str = f"{count} клан"
+            tot_str = f"  👥 {srv_online}" if srv_online else ""
+            cnt_str = clan_str + tot_str
+            draw.text(
+                (IMG_W - PAD - CARD_PAD - draw.textlength(cnt_str, font=fn_small), y + CARD_PAD + 3),
+                cnt_str, font=fn_small, fill=C_BORDER,
+            )
+
+            line_y = y + CARD_PAD + 26
+            draw.line([PAD + CARD_PAD, line_y, IMG_W - PAD - CARD_PAD, line_y], fill=(40, 40, 70), width=1)
+
+            row_y = line_y + 6
+
+            if cur_map:
+                draw.text((PAD + CARD_PAD, row_y), f"🗺  {cur_map}", font=fn_small, fill=C_GREY)
+                row_y += 18
+
+            state = game_state.get(key)
+            if state and state.get("since"):
+                now = datetime.now(timezone.utc) + timedelta(hours=3)
+                elapsed_min = int((now - state["since"]).total_seconds() // 60)
+                h, m = divmod(elapsed_min, 60)
+                elapsed_str = f"{h}ч {m}м" if h else f"{m}м"
+                teams_str = " vs ".join(sorted(state["teams"]))
+                draw.text(
+                    (PAD + CARD_PAD, row_y),
+                    f"⏱  Игра идёт {elapsed_str}  ·  {teams_str}",
+                    font=fn_small, fill=C_BORDER,
+                )
+                row_y += 22
+
+            if by_team:
+                for team, names in by_team.items():
+                    flag_img = load_flag(team, FLAG_SIZE)
+                    for entry in names:
+                        name = entry.get("name", "") if isinstance(entry, dict) else str(entry)
+                        text_x = PAD + CARD_PAD + FLAG_SIZE + 10
+                        if flag_img:
+                            img.paste(flag_img, (PAD + CARD_PAD, row_y + (ROW_H - FLAG_SIZE) // 2), flag_img)
+                        else:
+                            draw.text((PAD + CARD_PAD, row_y + 8), team[:3].upper(), font=fn_small, fill=C_BORDER)
+                            text_x = PAD + CARD_PAD + 36
+                        draw.text((text_x, row_y + 9), name, font=fn_player, fill=C_WHITE)
+                        row_y += ROW_H
+            else:
+                for p in players:
+                    name = p.get("name", "") if isinstance(p, dict) else str(p)
+                    draw.text((PAD + CARD_PAD + 10, row_y + 9), f"› {name}", font=fn_player, fill=C_WHITE)
+                    row_y += ROW_H
+
+            y += card_h + PAD
+
+    # ── Футер ──────────────────────────────────────
+    footer_y = img_h - FOOTER_H
+    draw.line([0, footer_y, IMG_W, footer_y], fill=(30, 30, 55), width=1)
+    draw.text((PAD, footer_y + 8), "NW Tracker", font=fn_small, fill=C_GREY)
+    draw.text(
+        (IMG_W - PAD - draw.textlength("made by stl", font=fn_small), footer_y + 8),
+        "made by stl", font=fn_small, fill=(80, 80, 100),
+    )
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf.read()
+
+
+# ─────────────────────────────────────────────
+#  ОПРОС API И ПУБЛИКАЦИЯ
+# ─────────────────────────────────────────────
+
+_online_message_id: dict[int, int] = {}
+_online_loop_started = False
+_game_state: dict[str, dict] = {}
+_map_state: dict[str, str] = {}
+
+
+SQSTAT_SERVER_MAP = {
+    "7": "Invasion",
+    "1": "AAS",
+    "6": "Spec Ops",
+    "9": "Custom",
+    "10": "Custom",
+    "11": "Custom",
+}
+
+_HEADERS_CLAN = {
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "X-Requested-With": "XMLHttpRequest",
+    "Origin": SQSTAT_BASE_URL,
+    "Referer": f"{SQSTAT_BASE_URL}/clan/{CLAN_ID}",
+    "User-Agent": "Mozilla/5.0",
+}
+_HEADERS_PUB = {
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": f"{SQSTAT_BASE_URL}/",
+    "User-Agent": "Mozilla/5.0",
+}
+
+
+async def _post_with_cookie(session: aiohttp.ClientSession, url: str, data: dict, headers: dict) -> str:
+    """sqstat иногда отдаёт JS-редирект с PHPSESID вместо JSON — повторяем запрос с куки."""
+    async with session.post(url, data=data, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        raw = await r.text()
+    if "PHPSESID=" in raw and "document.cookie" in raw:
+        m = re.search(r"PHPSESID=([^ ;]+)", raw)
+        if m:
+            async with session.post(
+                url, data=data, headers=headers,
+                cookies={"PHPSESID": m.group(1)},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r2:
+                raw = await r2.text()
+    return raw
+
+
+async def fetch_online_data() -> dict | None:
+    """
+    Парсит онлайн клана напрямую с sqstat (без стороннего сервера):
+    1. ajax/clan.php action=list — игроки клана по серверам
+    2. ajax/public.php action=statistics — текущая карта и онлайн каждого сервера
+    Возвращает структуру в формате, ожидаемом generate_online_image().
+    """
+    grouped: dict[str, list] = {"Invasion": [], "AAS": [], "Spec Ops": [], "Custom": []}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            raw_clan = await _post_with_cookie(
+                session, f"{SQSTAT_BASE_URL}/ajax/clan.php",
+                {"clan_id": CLAN_ID, "action": "list"}, _HEADERS_CLAN,
+            )
+            clan_data = json.loads(raw_clan)
+
+            server_info: dict[str, dict] = {}
+            try:
+                raw_pub = await _post_with_cookie(
+                    session, f"{SQSTAT_BASE_URL}/ajax/public.php",
+                    {"action": "statistics"}, _HEADERS_PUB,
+                )
+                pub_data = json.loads(raw_pub)
+                for sid, sinfo in pub_data.get("servers", {}).items():
+                    if isinstance(sinfo, dict):
+                        server_info[str(sid)] = {
+                            "map": sinfo.get("map", ""),
+                            "online": int(sinfo.get("online", 0) or 0),
+                        }
+            except Exception as e:
+                log.warning(f"public.php (карты/онлайн серверов): {e}")
+
+            for srv_id, srv_data in clan_data.get("servers", {}).items():
+                if not srv_data or isinstance(srv_data, list):
+                    continue
+
+                srv_name = SQSTAT_SERVER_MAP.get(str(srv_id), "Custom")
+                info = server_info.get(str(srv_id), {})
+                cur_map = info.get("map", "")
+                srv_online = info.get("online", 0)
+
+                for player_id, player_data in srv_data.items():
+                    if not isinstance(player_data, dict):
+                        continue
+                    name = player_data.get("name", "").strip()
+                    if not name or len(name) >= 50:
+                        continue
+                    if CLAN_TAG_FILTER and CLAN_TAG_FILTER.upper() not in name.upper():
+                        continue
+
+                    grouped.setdefault(srv_name, []).append({
+                        "name": name,
+                        "team": player_data.get("team", ""),
+                        "cur_map": cur_map,
+                        "srv_online": srv_online,
+                    })
+
+    except Exception as e:
+        log.error(f"fetch_online_data (sqstat scrape): {e}", exc_info=True)
+        return None
+
+    total_online = sum(len(v) for v in grouped.values())
+
+    servers_with_teams = {}
+    for server, players in grouped.items():
+        by_team: dict = {}
+        for p in players:
+            team = p.get("team", "Unknown") or "Unknown"
+            by_team.setdefault(team, []).append(p)
+        servers_with_teams[server] = {"players": players, "by_team": by_team}
+
+    return {"status": "success", "total_online": total_online, "servers": servers_with_teams}
+
+
+def is_seed_map(map_name: str) -> bool:
+    return any(kw in map_name.lower() for kw in SEED_MAP_KEYWORDS)
+
+
+def detect_game_changes(data: dict) -> list[str]:
+    """Обновляет _game_state/_map_state, возвращает список серверов где засид закончился."""
+    now = datetime.now(timezone.utc) + timedelta(hours=3)
+    servers = data.get("servers", {})
+    seed_ended: list[str] = []
+
+    for srv_key in SERVER_LABELS:
+        srv = servers.get(srv_key, {})
+        players = srv.get("players", []) if isinstance(srv, dict) else []
+        cur_map = players[0].get("cur_map", "") if players and isinstance(players[0], dict) else ""
+
+        prev_map = _map_state.get(srv_key, "")
+        if prev_map and cur_map and prev_map != cur_map:
+            if is_seed_map(prev_map) and not is_seed_map(cur_map):
+                log.info(f"Засид закончился на {srv_key}: {prev_map!r} -> {cur_map!r}")
+                seed_ended.append(srv_key)
+        if cur_map:
+            _map_state[srv_key] = cur_map
+
+        current_teams = frozenset(
+            p.get("team", "").strip() for p in players if isinstance(p, dict) and p.get("team", "").strip()
+        )
+
+        if not current_teams:
+            _game_state.pop(srv_key, None)
+            continue
+
+        prev = _game_state.get(srv_key)
+        if prev is None:
+            _game_state[srv_key] = {"teams": current_teams, "since": now}
+        elif current_teams != prev["teams"]:
+            log.info(f"Новая игра на {srv_key}: {set(prev['teams'])} -> {set(current_teams)}")
+            _game_state[srv_key] = {"teams": current_teams, "since": now}
+
+    return seed_ended
+
+
+async def _send_seed_alert(seed_ended: list[str]):
+    if not SEED_ALERT_CHANNEL_ID:
+        return
+    channel = bot.get_channel(SEED_ALERT_CHANNEL_ID)
+    if not channel:
+        log.warning(f"_send_seed_alert: канал {SEED_ALERT_CHANNEL_ID} не найден")
+        return
+    role_mention = f"<@&{SEED_ALERT_ROLE_ID}>" if SEED_ALERT_ROLE_ID else ""
+    if SEED_ALERT_ROLE_ID and channel.guild:
+        role = channel.guild.get_role(SEED_ALERT_ROLE_ID)
+        if role:
+            role_mention = role.mention
+    await channel.send(f"{role_mention} сервер засидился, заходите <3".strip())
+    log.info(f"Seed alert отправлен ({seed_ended})")
+
+
+async def post_or_edit_online(channel: discord.TextChannel):
+    data = await fetch_online_data()
+    if data is None:
+        log.warning("post_or_edit_online: нет данных с апишки")
+        return
+
+    seed_ended = detect_game_changes(data)
+    if seed_ended and SEED_ALERT_CHANNEL_ID:
+        asyncio.create_task(_send_seed_alert(seed_ended))
+
+    try:
+        img_bytes = generate_online_image(data, _game_state)
+    except Exception as e:
+        log.error(f"generate_online_image: {e}", exc_info=True)
+        return
+
+    ch_id = channel.id
+
+    if ch_id in _online_message_id:
+        try:
+            old_msg = await channel.fetch_message(_online_message_id[ch_id])
+            await old_msg.delete()
+        except discord.NotFound:
+            pass
+        except Exception as e:
+            log.warning(f"Не удалось удалить старое сообщение: {e}")
+        del _online_message_id[ch_id]
+
+    file = discord.File(io.BytesIO(img_bytes), filename="online.png")
+    msg = await channel.send(file=file)
+    _online_message_id[ch_id] = msg.id
+    log.info(f"Онлайн опубликован в #{channel.name}")
+
+
+async def start_online_loop():
+    global _online_loop_started
+    if _online_loop_started:
+        log.warning("start_online_loop: уже запущен, пропускаем")
+        return
+    _online_loop_started = True
+
+    await bot.wait_until_ready()
+    log.info(f"Онлайн-трекер запущен, канал {ONLINE_CHANNEL_ID}, интервал {POLL_INTERVAL_SECONDS}с")
+
+    while True:
+        try:
+            channel = bot.get_channel(ONLINE_CHANNEL_ID)
+            if channel:
+                await post_or_edit_online(channel)
+            else:
+                log.warning(f"Онлайн-канал {ONLINE_CHANNEL_ID} не найден")
+        except Exception as e:
+            log.error(f"Ошибка онлайн-цикла: {e}", exc_info=True)
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+# ─────────────────────────────────────────────
+#  СОБЫТИЯ БОТА
+# ─────────────────────────────────────────────
+
+
+@bot.event
+async def on_ready():
+    log.info(f"Бот запущен: {bot.user} ({bot.user.id})")
+    asyncio.create_task(start_online_loop())
+
+
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN)
