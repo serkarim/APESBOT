@@ -59,6 +59,20 @@ SEED_ALERT_CHANNEL_ID = int(_seed_channel) if _seed_channel else None
 SEED_ALERT_ROLE_ID = int(_seed_role) if _seed_role else None
 SEED_MAP_KEYWORDS = ["seed", "сид"]
 
+# ─────────────────────────────────────────────
+# Доп. сервер без sqstat (PSTN) — парсим через внутренний Next.js Server Action
+# squadbrowser.app. Требует периодического обновления NEXT_ACTION при редеплое
+# их сайта (см. .env.example и инструкцию в README).
+# ─────────────────────────────────────────────
+SQUADBROWSER_SERVER_ID = _get_env("SQUADBROWSER_SERVER_ID", required=False, default="")
+SQUADBROWSER_NEXT_ACTION = _get_env("SQUADBROWSER_NEXT_ACTION", required=False, default="")
+SQUADBROWSER_PAGE_URL = _get_env("SQUADBROWSER_PAGE_URL", required=False, default="https://squadbrowser.app/")
+SQUADBROWSER_LABEL = _get_env("SQUADBROWSER_LABEL", required=False, default="PSTN")
+# Обычно не нужно — action на squadbrowser отвечает и без сессии.
+# Если бот получает 401/403, скопируй заголовок Cookie из DevTools и вставь сюда как есть.
+SQUADBROWSER_COOKIE = _get_env("SQUADBROWSER_COOKIE", required=False, default="")
+SQUADBROWSER_ENABLED = bool(SQUADBROWSER_SERVER_ID and SQUADBROWSER_NEXT_ACTION)
+
 # Папка с флагами фракций: flags/afu.png, flags/rgf.png ...
 FLAGS_DIR = "flags"
 
@@ -108,12 +122,15 @@ SERVER_LABELS = {
     "AAS": "МИКС",
     "Spec Ops": "SPEC OPS",
     "Custom": "CUSTOM",
+    SQUADBROWSER_LABEL: SQUADBROWSER_LABEL.upper(),
 }
 
 
 _FONT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PREFERRED_FONT = os.path.join(_FONT_DIR, "NotoSans-Cyrillic.ttf")
+_SYMBOLS_FONT = os.path.join(_FONT_DIR, "NotoSansSymbols-Fallback.ttf")
 _font_cache: dict[int, ImageFont.FreeTypeFont] = {}
+_symbol_font_cache: dict[int, ImageFont.FreeTypeFont] = {}
 
 
 def load_font(size: int):
@@ -137,7 +154,7 @@ def load_font(size: int):
     if font is None:
         try:
             for f in os.listdir(_FONT_DIR):
-                if f.endswith(".ttf"):
+                if f.endswith(".ttf") and f != os.path.basename(_SYMBOLS_FONT):
                     font = ImageFont.truetype(os.path.join(_FONT_DIR, f), size)
                     break
         except Exception:
@@ -161,6 +178,78 @@ def load_font(size: int):
 
     _font_cache[size] = font
     return font
+
+
+def load_symbol_font(size: int):
+    """
+    Запасной шрифт для символов/дингбатов, которых нет в основном шрифте
+    (например ❀ и подобные украшения в никах/тегах кланов).
+    """
+    if size in _symbol_font_cache:
+        return _symbol_font_cache[size]
+    font = None
+    if os.path.exists(_SYMBOLS_FONT):
+        try:
+            font = ImageFont.truetype(_SYMBOLS_FONT, size)
+        except Exception as e:
+            log.warning(f"Не удалось загрузить {_SYMBOLS_FONT}: {e}")
+    if font is None:
+        font = load_font(size)
+    _symbol_font_cache[size] = font
+    return font
+
+
+_cmap_cache: dict[str, set] = {}
+
+
+def _get_font_cmap(font_path: str) -> set:
+    """Множество кодпоинтов, реально поддерживаемых шрифтом (через таблицу cmap)."""
+    if font_path in _cmap_cache:
+        return _cmap_cache[font_path]
+    codepoints: set = set()
+    try:
+        from fontTools.ttLib import TTFont as _TTFont
+        tt = _TTFont(font_path, lazy=True)
+        codepoints = set(tt.getBestCmap().keys())
+    except Exception as e:
+        log.warning(f"Не удалось прочитать cmap {font_path}: {e}")
+    _cmap_cache[font_path] = codepoints
+    return codepoints
+
+
+def _font_has_glyph(font_path: str, ch: str) -> bool:
+    if ch.isspace():
+        return True
+    return ord(ch) in _get_font_cmap(font_path)
+
+
+def draw_text_mixed(draw: ImageDraw.ImageDraw, xy: tuple, text: str, size: int, fill, anchor=None):
+    """
+    Рисует текст, автоматически переключаясь на запасной шрифт символов
+    для символов, отсутствующих в основном (кириллическом) шрифте.
+    Не поддерживает произвольные anchor-режимы PIL — только левый верхний угол по x,y.
+    """
+    main_font = load_font(size)
+    sym_font = load_symbol_font(size)
+    main_has = os.path.exists(_PREFERRED_FONT)
+    x, y = xy
+    for ch in text:
+        use_main = _font_has_glyph(_PREFERRED_FONT, ch) if main_has else True
+        font = main_font if use_main else sym_font
+        draw.text((x, y), ch, font=font, fill=fill)
+        x += draw.textlength(ch, font=font)
+
+
+def text_length_mixed(draw: ImageDraw.ImageDraw, text: str, size: int) -> float:
+    main_font = load_font(size)
+    sym_font = load_symbol_font(size)
+    main_has = os.path.exists(_PREFERRED_FONT)
+    total = 0.0
+    for ch in text:
+        use_main = _font_has_glyph(_PREFERRED_FONT, ch) if main_has else True
+        font = main_font if use_main else sym_font
+        total += draw.textlength(ch, font=font)
+    return total
 
 
 def load_flag(team_code: str, size: int):
@@ -220,8 +309,8 @@ def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
     # ── Шапка ──────────────────────────────────────
     draw.rectangle([0, 0, IMG_W, HEADER_H], fill=C_HEADER_BG)
     draw.rectangle([0, 0, 4, HEADER_H], fill=C_BORDER)
-    draw.text((PAD, 10), CLAN_DISPLAY_NAME, font=fn_title, fill=C_BORDER)
-    draw.text((PAD, 34), f"В ИГРЕ // {CLAN_DISPLAY_NAME.upper()}", font=fn_small, fill=C_GREY)
+    draw_text_mixed(draw, (PAD, 10), CLAN_DISPLAY_NAME, 18, C_BORDER)
+    draw_text_mixed(draw, (PAD, 34), f"В ИГРЕ // {CLAN_DISPLAY_NAME.upper()}", 11, C_GREY)
 
     dot_x = IMG_W - PAD - 8
     dot_y = 20
@@ -290,12 +379,12 @@ def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
                         else:
                             draw.text((PAD + CARD_PAD, row_y + 8), team[:3].upper(), font=fn_small, fill=C_BORDER)
                             text_x = PAD + CARD_PAD + 36
-                        draw.text((text_x, row_y + 9), name, font=fn_player, fill=C_WHITE)
+                        draw_text_mixed(draw, (text_x, row_y + 9), name, 14, C_WHITE)
                         row_y += ROW_H
             else:
                 for p in players:
                     name = p.get("name", "") if isinstance(p, dict) else str(p)
-                    draw.text((PAD + CARD_PAD + 10, row_y + 9), f"› {name}", font=fn_player, fill=C_WHITE)
+                    draw_text_mixed(draw, (PAD + CARD_PAD + 10, row_y + 9), f"› {name}", 14, C_WHITE)
                     row_y += ROW_H
 
             y += card_h + PAD
@@ -303,7 +392,7 @@ def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
     # ── Футер ──────────────────────────────────────
     footer_y = img_h - FOOTER_H
     draw.line([0, footer_y, IMG_W, footer_y], fill=(30, 30, 55), width=1)
-    draw.text((PAD, footer_y + 8), f"{CLAN_DISPLAY_NAME} Tracker", font=fn_small, fill=C_GREY)
+    draw_text_mixed(draw, (PAD, footer_y + 8), f"{CLAN_DISPLAY_NAME} Tracker", 11, C_GREY)
     draw.text(
         (IMG_W - PAD - draw.textlength("made by stl", font=fn_small), footer_y + 8),
         "made by stl", font=fn_small, fill=(80, 80, 100),
@@ -323,6 +412,9 @@ _online_message_id: dict[int, int] = {}
 _online_loop_started = False
 _game_state: dict[str, dict] = {}
 _map_state: dict[str, str] = {}
+# Копится по мере опросов sqstat: steam_id всех когда-либо увиденных участников клана.
+# Используется, чтобы узнавать своих на сервере без sqstat (PSTN) — там теги в нике не показываются.
+_known_clan_steam_ids: set[str] = set()
 
 
 SQSTAT_SERVER_MAP = {
@@ -363,6 +455,116 @@ async def _post_with_cookie(session: aiohttp.ClientSession, url: str, data: dict
             ) as r2:
                 raw = await r2.text()
     return raw
+
+
+def _fix_mojibake(s: str) -> str:
+    """
+    squadbrowser иногда отдаёт кириллицу/эмодзи как UTF-8-байты, ошибочно
+    прочитанные как Windows-1252 (например 'ÐŸÐµÑ€Ð²Ñ‹Ð¹' вместо 'Первый').
+    Пытаемся откатить это обратно; если не получается — отдаём как есть
+    (единичные ники всё равно могут остаться повреждёнными — это баг на их стороне).
+    """
+    if not s:
+        return s
+    try:
+        fixed = s.encode("cp1252").decode("utf-8")
+        if fixed.count("Ð") < s.count("Ð") or fixed != s:
+            return fixed
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return s
+
+
+async def fetch_squadbrowser_live() -> dict | None:
+    """
+    Забирает live-данные сервера без sqstat (PSTN) через внутренний Next.js
+    Server Action сайта squadbrowser.app. Это не публичный API — Next-Action
+    хэш зашит в конкретную сборку их сайта и может измениться при редеплое.
+    Если бот вдруг перестал видеть этот сервер — скорее всего именно это,
+    нужно достать новый хэш из DevTools (см. .env.example) и обновить
+    SQUADBROWSER_NEXT_ACTION.
+    """
+    headers = {
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Accept": "text/x-component",
+        "Next-Action": SQUADBROWSER_NEXT_ACTION,
+        "Next-Router-State-Tree": '["",{"children":["__PAGE__",{},null,null]},null,null,true]',
+        "Origin": "https://squadbrowser.app",
+        "Referer": SQUADBROWSER_PAGE_URL,
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+        ),
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    }
+    if SQUADBROWSER_COOKIE:
+        headers["Cookie"] = SQUADBROWSER_COOKIE
+
+    payload = json.dumps([SQUADBROWSER_SERVER_ID])
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                SQUADBROWSER_PAGE_URL, data=payload, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                raw = await resp.text()
+                if resp.status != 200:
+                    log.warning(
+                        f"fetch_squadbrowser_live: HTTP {resp.status} — возможно, устарел "
+                        f"Next-Action хэш или нужны куки (SQUADBROWSER_COOKIE). Ответ: {raw[:200]!r}"
+                    )
+    except Exception as e:
+        log.error(f"fetch_squadbrowser_live: сетевая ошибка: {e}")
+        return None
+
+    # Ответ — построчный RSC-стрим Next.js: "0:{...}\n1:{...ok...}\n"
+    payload_json = None
+    for line in raw.splitlines():
+        if ":" not in line:
+            continue
+        _, _, rest = line.partition(":")
+        rest = rest.strip()
+        if not rest.startswith('{"ok"'):
+            continue
+        try:
+            payload_json = json.loads(rest)
+            break
+        except json.JSONDecodeError:
+            continue
+
+    if not payload_json or not payload_json.get("ok"):
+        log.warning(
+            f"fetch_squadbrowser_live: неожиданный формат ответа, возможно устарел "
+            f"Next-Action хэш (первые 200 симв.): {raw[:200]!r}"
+        )
+        return None
+
+    live = (payload_json.get("data") or {}).get("live") or {}
+    if not live:
+        return None  # сервер офлайн или нет данных
+
+    cur_map = live.get("current_map", "") or ""
+    srv_online = live.get("current_players", 0) or 0
+
+    players = []
+    for p in live.get("players", []):
+        name = _fix_mojibake((p.get("display_name") or "").strip())
+        if not name:
+            continue
+        steam_id = str(p.get("steam_id", "") or "")
+        team = (p.get("team") or "").strip() or "Unknown"
+        players.append({
+            "name": name,
+            "team": team,
+            "cur_map": cur_map,
+            "srv_online": srv_online,
+            "steam_id": steam_id,
+        })
+
+    return {"cur_map": cur_map, "srv_online": srv_online, "players": players}
 
 
 async def fetch_online_data() -> dict | None:
@@ -425,17 +627,41 @@ async def fetch_online_data() -> dict | None:
                     if team_code:
                         seen_team_codes.add(str(team_code))
 
+                    steam_id = str(player_id)
+                    if steam_id.isdigit():
+                        _known_clan_steam_ids.add(steam_id)
+
                     grouped.setdefault(srv_name, []).append({
                         "name": name,
                         "team": team_code,
                         "cur_map": cur_map,
                         "srv_online": srv_online,
+                        "steam_id": steam_id,
                     })
 
             log.info(
                 f"sqstat: всего игроков на серверах {raw_total}, прошло фильтр тегов {matched_total}, "
-                f"коды фракций в текущей выдаче: {sorted(seen_team_codes)}"
+                f"коды фракций в текущей выдаче: {sorted(seen_team_codes)}, "
+                f"известно steam_id клана всего: {len(_known_clan_steam_ids)}"
             )
+
+            if SQUADBROWSER_ENABLED:
+                try:
+                    pstn = await fetch_squadbrowser_live()
+                    if pstn:
+                        matched_pstn = []
+                        for p in pstn["players"]:
+                            is_known = p["steam_id"] in _known_clan_steam_ids
+                            is_tagged = CLAN_TAGS and any(tag in p["name"].upper() for tag in CLAN_TAGS)
+                            if is_known or is_tagged:
+                                matched_pstn.append(p)
+                        log.info(
+                            f"{SQUADBROWSER_LABEL} (squadbrowser): игроков на сервере {len(pstn['players'])}, "
+                            f"опознано как свои {len(matched_pstn)}"
+                        )
+                        grouped[SQUADBROWSER_LABEL] = matched_pstn
+                except Exception as e:
+                    log.error(f"squadbrowser: {e}", exc_info=True)
 
     except Exception as e:
         log.error(f"fetch_online_data (sqstat scrape): {e}", exc_info=True)
