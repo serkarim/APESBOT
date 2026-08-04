@@ -628,8 +628,17 @@ async def fetch_online_data() -> dict | None:
                         seen_team_codes.add(str(team_code))
 
                     steam_id = str(player_id)
-                    if steam_id.isdigit():
+                    looks_like_steam64 = steam_id.isdigit() and len(steam_id) == 17 and steam_id.startswith("7656119")
+                    if looks_like_steam64:
                         _known_clan_steam_ids.add(steam_id)
+
+                    if matched_total <= 3:
+                        # Диагностика: смотрим, действительно ли ключ player_id из clan.php
+                        # является SteamID64 (17 цифр, начинается с 7656119...), как мы предполагаем.
+                        log.info(
+                            f"sqstat DEBUG #{matched_total}: player_id={player_id!r}, "
+                            f"похож на SteamID64: {looks_like_steam64}, player_data={player_data!r}"
+                        )
 
                     grouped.setdefault(srv_name, []).append({
                         "name": name,
