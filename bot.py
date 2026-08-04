@@ -596,6 +596,29 @@ async def fetch_online_data() -> dict | None:
             )
             clan_data = json.loads(raw_clan)
 
+            # Полный ростер клана (панелька) — все участники, независимо от того,
+            # онлайн они сейчас или нет. Отдельное поле в том же ответе clan.php,
+            # не путать с data["servers"] (там только те, кто сейчас в игре).
+            roster_total = 0
+            for p in clan_data.get("players", []):
+                if not isinstance(p, dict):
+                    continue
+                raw_name = (p.get("name") or "").strip()
+                if not raw_name:
+                    continue
+                bare = _bare_name(raw_name)
+                if bare:
+                    _known_clan_names.add(bare)
+                    roster_total += 1
+
+            if roster_total == 0:
+                log.warning(
+                    f"sqstat: clan_data['players'] пуст или отсутствует (ключи в ответе: "
+                    f"{list(clan_data.keys())}) — полный ростер не загружен, "
+                    f"известные ники будут копиться только из тех, кто сейчас в игре"
+                )
+            log.info(f"sqstat: полный ростер клана — {roster_total} ников, известно всего: {len(_known_clan_names)}")
+
             server_info: dict[str, dict] = {}
             try:
                 raw_pub = await _post_with_cookie(
