@@ -412,9 +412,21 @@ _online_message_id: dict[int, int] = {}
 _online_loop_started = False
 _game_state: dict[str, dict] = {}
 _map_state: dict[str, str] = {}
-# Копится по мере опросов sqstat: steam_id всех когда-либо увиденных участников клана.
-# Используется, чтобы узнавать своих на сервере без sqstat (PSTN) — там теги в нике не показываются.
-_known_clan_steam_ids: set[str] = set()
+# Копится по мере опросов sqstat: "голые" ники (без тега клана, в нижнем регистре)
+# всех когда-либо увиденных участников клана. Используется, чтобы узнавать своих
+# на сервере без sqstat (PSTN) — там нет тега, но ник обычно тот же самый.
+# ВАЖНО: sqstat не отдаёт настоящий SteamID64 в clan.php (там просто порядковый
+# номер слота вида "54"), поэтому матчинг идёт по нику, а не по ID.
+_known_clan_names: set[str] = set()
+
+
+def _bare_name(name: str) -> str:
+    """Убирает тег клана и обрамляющий мусор (скобки/разделители), чтобы сравнивать чистые ники."""
+    result = name
+    for tag in CLAN_TAGS:
+        result = re.sub(re.escape(tag), "", result, flags=re.IGNORECASE)
+    result = result.strip(" \t\r\n-_|[](){}:❀·•")
+    return result.strip().lower()
 
 
 SQSTAT_SERVER_MAP = {
@@ -627,31 +639,22 @@ async def fetch_online_data() -> dict | None:
                     if team_code:
                         seen_team_codes.add(str(team_code))
 
-                    steam_id = str(player_id)
-                    looks_like_steam64 = steam_id.isdigit() and len(steam_id) == 17 and steam_id.startswith("7656119")
-                    if looks_like_steam64:
-                        _known_clan_steam_ids.add(steam_id)
-
-                    if matched_total <= 3:
-                        # Диагностика: смотрим, действительно ли ключ player_id из clan.php
-                        # является SteamID64 (17 цифр, начинается с 7656119...), как мы предполагаем.
-                        log.info(
-                            f"sqstat DEBUG #{matched_total}: player_id={player_id!r}, "
-                            f"похож на SteamID64: {looks_like_steam64}, player_data={player_data!r}"
-                        )
+                    bare = _bare_name(name)
+                    if bare:
+                        _known_clan_names.add(bare)
 
                     grouped.setdefault(srv_name, []).append({
                         "name": name,
                         "team": team_code,
                         "cur_map": cur_map,
                         "srv_online": srv_online,
-                        "steam_id": steam_id,
+                        "bare_name": bare,
                     })
 
             log.info(
                 f"sqstat: всего игроков на серверах {raw_total}, прошло фильтр тегов {matched_total}, "
                 f"коды фракций в текущей выдаче: {sorted(seen_team_codes)}, "
-                f"известно steam_id клана всего: {len(_known_clan_steam_ids)}"
+                f"известно ников клана всего: {len(_known_clan_names)}"
             )
 
             if SQUADBROWSER_ENABLED:
@@ -660,13 +663,14 @@ async def fetch_online_data() -> dict | None:
                     if pstn:
                         matched_pstn = []
                         for p in pstn["players"]:
-                            is_known = p["steam_id"] in _known_clan_steam_ids
+                            p_bare = _bare_name(p["name"])
+                            is_known = bool(p_bare) and p_bare in _known_clan_names
                             is_tagged = CLAN_TAGS and any(tag in p["name"].upper() for tag in CLAN_TAGS)
                             if is_known or is_tagged:
                                 matched_pstn.append(p)
                         log.info(
                             f"{SQUADBROWSER_LABEL} (squadbrowser): игроков на сервере {len(pstn['players'])}, "
-                            f"опознано как свои {len(matched_pstn)}"
+                            f"опознано как свои {len(matched_pstn)} (известно ников клана: {len(_known_clan_names)})"
                         )
                         grouped[SQUADBROWSER_LABEL] = matched_pstn
                 except Exception as e:
