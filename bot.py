@@ -655,14 +655,17 @@ async def fetch_online_data() -> dict | None:
                     if not name or len(name) >= 50:
                         continue
                     raw_total += 1
-                    if CLAN_TAGS and not any(tag in name.upper() for tag in CLAN_TAGS):
+                    name_bare = _bare_name(name)
+                    is_tagged = CLAN_TAGS and any(tag in name.upper() for tag in CLAN_TAGS)
+                    is_in_roster = bool(name_bare) and name_bare in _known_clan_names
+                    if CLAN_TAGS and not (is_tagged or is_in_roster):
                         continue
                     matched_total += 1
                     team_code = player_data.get("team", "")
                     if team_code:
                         seen_team_codes.add(str(team_code))
 
-                    bare = _bare_name(name)
+                    bare = name_bare
                     if bare:
                         _known_clan_names.add(bare)
 
