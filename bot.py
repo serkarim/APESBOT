@@ -92,6 +92,7 @@ log = logging.getLogger("nw-online-bot")
 # ─────────────────────────────────────────────
 
 intents = discord.Intents.default()
+intents.message_content = True  # нужно для команд !roster / !pstndebug
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ─────────────────────────────────────────────
@@ -419,14 +420,53 @@ _map_state: dict[str, str] = {}
 # номер слота вида "54"), поэтому матчинг идёт по нику, а не по ID.
 _known_clan_names: set[str] = set()
 
+# Кириллица и латиница часто визуально неотличимы (А/A, Е/E, Р/P и т.д.) — люди
+# copy-paste'ят тег откуда попало, и в никах гуляют вперемешку разные варианты
+# одного и того же тега. Нормализуем такие "омоглифы" к латинице ПЕРЕД сравнением,
+# чтобы не пришлось вручную перечислять каждую комбинацию в CLAN_TAG_FILTER.
+_HOMOGLYPH_MAP = str.maketrans(
+    "АВЕКМНОРСТУХаеорсух",
+    "ABEKMHOPCTYXaeopcyx",
+)
+# Декоративные "цветочки", которые часто оборачивают теги — если в CLAN_TAG_FILTER
+# перечислен не тот вариант символа, всё равно срежем его как обрамляющий мусор.
+_DECOR_CHARS = "❀✿✾✽✼✻✺✹✸❁❃❋"
+
+
+def _normalize_homoglyphs(s: str) -> str:
+    return s.translate(_HOMOGLYPH_MAP)
+
+
+def _has_clan_tag(name: str) -> bool:
+    """Проверяет, есть ли в нике буквально один из CLAN_TAGS — с учётом омоглифов (А/A и т.п.)."""
+    if not CLAN_TAGS:
+        return False
+    norm_name = _normalize_homoglyphs(name).upper()
+    return any(_normalize_homoglyphs(tag).upper() in norm_name for tag in CLAN_TAGS)
+
 
 def _bare_name(name: str) -> str:
-    """Убирает тег клана и обрамляющий мусор (скобки/разделители), чтобы сравнивать чистые ники."""
-    result = name
+    """
+    Убирает тег клана и обрамляющий мусор (скобки/разделители/цветочки-декорации),
+    чтобы сравнивать чистые ники. Кириллица/латиница нормализуется, так что
+    '✿A✿ stl' и '✿А✿ stl' (латинская и кириллическая A) дадут один результат.
+    """
+    result = _normalize_homoglyphs(name)
     for tag in CLAN_TAGS:
-        result = re.sub(re.escape(tag), "", result, flags=re.IGNORECASE)
-    result = result.strip(" \t\r\n-_|[](){}:❀·•")
+        result = re.sub(re.escape(_normalize_homoglyphs(tag)), "", result, flags=re.IGNORECASE)
+    result = result.strip(" \t\r\n-_|[](){}:·•" + _DECOR_CHARS)
     return result.strip().lower()
+
+
+def _log_roster_dump(chunk_size: int = 40):
+    """Пишет в лог весь текущий список известных ников клана — чтобы не лезть за этим в Discord-команду."""
+    if not _known_clan_names:
+        log.info("sqstat: ростер пуст — известных ников клана пока нет")
+        return
+    names = sorted(_known_clan_names)
+    for i in range(0, len(names), chunk_size):
+        part = names[i:i + chunk_size]
+        log.info(f"sqstat ростер [{i + 1}-{i + len(part)}/{len(names)}]: {', '.join(part)}")
 
 
 SQSTAT_SERVER_MAP = {
@@ -618,6 +658,7 @@ async def fetch_online_data() -> dict | None:
                     f"известные ники будут копиться только из тех, кто сейчас в игре"
                 )
             log.info(f"sqstat: полный ростер клана — {roster_total} ников, известно всего: {len(_known_clan_names)}")
+            _log_roster_dump()
 
             server_info: dict[str, dict] = {}
             try:
@@ -656,7 +697,7 @@ async def fetch_online_data() -> dict | None:
                         continue
                     raw_total += 1
                     name_bare = _bare_name(name)
-                    is_tagged = CLAN_TAGS and any(tag in name.upper() for tag in CLAN_TAGS)
+                    is_tagged = _has_clan_tag(name)
                     is_in_roster = bool(name_bare) and name_bare in _known_clan_names
                     if CLAN_TAGS and not (is_tagged or is_in_roster):
                         continue
@@ -691,7 +732,7 @@ async def fetch_online_data() -> dict | None:
                         for p in pstn["players"]:
                             p_bare = _bare_name(p["name"])
                             is_known = bool(p_bare) and p_bare in _known_clan_names
-                            is_tagged = CLAN_TAGS and any(tag in p["name"].upper() for tag in CLAN_TAGS)
+                            is_tagged = _has_clan_tag(p["name"])
                             if is_known or is_tagged:
                                 matched_pstn.append(p)
                         log.info(
@@ -830,6 +871,68 @@ async def start_online_loop():
         except Exception as e:
             log.error(f"Ошибка онлайн-цикла: {e}", exc_info=True)
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+# ─────────────────────────────────────────────
+#  ОТЛАДОЧНЫЕ КОМАНДЫ
+# ─────────────────────────────────────────────
+
+
+def _chunk_text(text: str, limit: int = 1900):
+    """Режет длинный текст на куски, безопасные для лимита сообщений Discord (2000 симв.)."""
+    lines = text.split("\n")
+    chunks, cur = [], ""
+    for line in lines:
+        if len(cur) + len(line) + 1 > limit:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+@bot.command(name="roster")
+async def cmd_roster(ctx: commands.Context):
+    """Показывает все ники, которые бот сейчас считает участниками клана (после снятия тега)."""
+    if not _known_clan_names:
+        await ctx.send("Пока не знаю ни одного ника клана — подожди следующего опроса sqstat.")
+        return
+    names = sorted(_known_clan_names)
+    body = "\n".join(names)
+    header = f"Известно ников клана: {len(names)}\n```\n"
+    footer = "\n```"
+    for i, chunk in enumerate(_chunk_text(body, 1900 - len(header) - len(footer))):
+        text = f"{header}{chunk}{footer}" if i == 0 else f"```\n{chunk}\n```"
+        await ctx.send(text)
+
+
+@bot.command(name="pstndebug")
+async def cmd_pstn_debug(ctx: commands.Context):
+    """Свежий запрос к squadbrowser + построчный разбор: кто опознан своим, кто нет и почему."""
+    if not SQUADBROWSER_ENABLED:
+        await ctx.send("PSTN/squadbrowser не настроен (нет SQUADBROWSER_SERVER_ID / SQUADBROWSER_NEXT_ACTION).")
+        return
+
+    await ctx.send("Опрашиваю squadbrowser...")
+    pstn = await fetch_squadbrowser_live()
+    if not pstn:
+        await ctx.send("Не удалось получить данные с squadbrowser (см. логи Railway — скорее всего протух Next-Action).")
+        return
+
+    lines = [f"Карта: {pstn['cur_map']}  Онлайн: {pstn['srv_online']}  Игроков в списке: {len(pstn['players'])}", ""]
+    for p in pstn["players"]:
+        p_bare = _bare_name(p["name"])
+        is_known = bool(p_bare) and p_bare in _known_clan_names
+        is_tagged = _has_clan_tag(p["name"])
+        matched = is_known or is_tagged
+        mark = "✅" if matched else "  "
+        reason = "roster" if is_known else ("tag" if is_tagged else "-")
+        lines.append(f"{mark} {p['name']!r:30} -> bare={p_bare!r:20} matched={matched} ({reason})")
+
+    body = "\n".join(lines)
+    for chunk in _chunk_text(body, 1900):
+        await ctx.send(f"```\n{chunk}\n```")
 
 
 # ─────────────────────────────────────────────
