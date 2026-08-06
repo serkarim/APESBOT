@@ -271,7 +271,7 @@ def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
     dot_x = IMG_W - PAD - 8
     dot_y = 20
     draw.ellipse([dot_x - 6, dot_y - 6, dot_x + 6, dot_y + 6], fill=C_GREEN if total > 0 else C_RED_DOT)
-    count_text = f"{total} бойцов онлайн"
+    count_text = f"{total} апездолов онлайн"
     bbox = draw.textbbox((0, 0), count_text, font=fn_count)
     tw = bbox[2] - bbox[0]
     draw.text((dot_x - 12 - tw, dot_y - 8), count_text, font=fn_count, fill=C_GREEN if total > 0 else C_GREY)
@@ -293,8 +293,8 @@ def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
             draw.rectangle([PAD, y, PAD + 3, y + card_h], fill=C_BORDER)
 
             draw.text((PAD + CARD_PAD, y + CARD_PAD), label, font=fn_server, fill=C_WHITE)
-            clan_str = f"{count} клан"
-            tot_str = f"  👥 {srv_online}" if srv_online else ""
+            clan_str = f"{count} наших"
+            tot_str = f"  всего игроков {srv_online}" if srv_online else ""
             cnt_str = clan_str + tot_str
             draw.text(
                 (IMG_W - PAD - CARD_PAD - draw.textlength(cnt_str, font=fn_small), y + CARD_PAD + 3),
