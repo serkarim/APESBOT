@@ -498,7 +498,12 @@ async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, 
             if not srv_data or isinstance(srv_data, list):
                 continue
 
-            srv_name = default_srv_label or SQSTAT_SERVER_MAP.get(str(srv_id), "Custom")
+            # ИСПРАВЛЕНИЕ: если задан метка по умолчанию (для PSTN), используем её приоритетно
+            if default_srv_label:
+                srv_name = default_srv_label
+            else:
+                srv_name = SQSTAT_SERVER_MAP.get(str(srv_id), "Custom")
+
             info = server_info.get(str(srv_id), {})
             cur_map = info.get("map", "")
             srv_online = info.get("online", 0)
@@ -524,10 +529,9 @@ async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, 
                 })
 
     except Exception as e:
-        log.error(f" Ошибка парсинга sqstat ({base_url}): {e}")
+        log.error(f"Ошибка парсинга sqstat ({base_url}): {e}")
 
     return result
-
 
 async def fetch_online_data() -> dict | None:
     """Парсит оба ресурса sqstat (Основной и PSTN) параллельно и объединяет выдачу."""
