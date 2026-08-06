@@ -1,6 +1,6 @@
 """
-NW Discord Bot — модуль мониторинга онлайна.
-Каждые POLL_INTERVAL_SECONDS секунд запрашивает {API_BASE_URL}/nwst/api/online
+NW Discord Bot — модуль мониторинга онлайна (sqstat + pstn.sqstat.ru).
+Каждые POLL_INTERVAL_SECONDS секунд запрашивает данные с обоих сайтов sqstat
 и публикует/обновляет PNG-карточку с текущим онлайном в указанном канале.
 
 Требования: discord.py, aiohttp, Pillow (см. requirements.txt)
@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -22,7 +23,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()  # локально подхватит .env; на Railway переменные и так в окружении
+    load_dotenv()
 except ImportError:
     pass
 
@@ -42,38 +43,27 @@ DISCORD_TOKEN = _get_env("DISCORD_TOKEN")
 ONLINE_CHANNEL_ID = int(_get_env("ONLINE_CHANNEL_ID"))
 POLL_INTERVAL_SECONDS = int(_get_env("POLL_INTERVAL_SECONDS", required=False, default="120"))
 
-# Прямой парсинг sqstat — никакого стороннего API больше не нужно
+# Основной sqstat
 SQSTAT_BASE_URL = _get_env("SQSTAT_BASE_URL", required=False, default="https://breaking.proxy.sqstat.ru").rstrip("/")
 CLAN_ID = _get_env("CLAN_ID", required=False, default="127")
-# Фильтр по тегу клана в нике игрока (пусто = без фильтра, показывать всех)
+
+# Второй sqstat (PSTN)
+PSTN_SQSTAT_BASE_URL = _get_env("PSTN_SQSTAT_BASE_URL", required=False, default="https://pstn.sqstat.ru").rstrip("/")
+PSTN_CLAN_ID = _get_env("PSTN_CLAN_ID", required=False, default="21")
+PSTN_LABEL = _get_env("PSTN_LABEL", required=False, default="PSTN")
+
+# Фильтр по тегу клана в нике игрока
 CLAN_TAG_FILTER = _get_env("CLAN_TAG_FILTER", required=False, default="apes")
-# Поддержка нескольких тегов через запятую: "❀A❀,APES" -> совпадение хотя бы с одним
 CLAN_TAGS = [t.strip().upper() for t in CLAN_TAG_FILTER.split(",") if t.strip()]
-# Название клана для шапки/футера карточки
 CLAN_DISPLAY_NAME = _get_env("CLAN_DISPLAY_NAME", required=False, default="Apes")
 
-# Уведомление о конце засида — опционально
+# Уведомления о конце засида
 _seed_channel = os.environ.get("SEED_ALERT_CHANNEL_ID")
 _seed_role = os.environ.get("SEED_ALERT_ROLE_ID")
 SEED_ALERT_CHANNEL_ID = int(_seed_channel) if _seed_channel else None
 SEED_ALERT_ROLE_ID = int(_seed_role) if _seed_role else None
 SEED_MAP_KEYWORDS = ["seed", "сид"]
 
-# ─────────────────────────────────────────────
-# Доп. сервер без sqstat (PSTN) — парсим через внутренний Next.js Server Action
-# squadbrowser.app. Требует периодического обновления NEXT_ACTION при редеплое
-# их сайта (см. .env.example и инструкцию в README).
-# ─────────────────────────────────────────────
-SQUADBROWSER_SERVER_ID = _get_env("SQUADBROWSER_SERVER_ID", required=False, default="")
-SQUADBROWSER_NEXT_ACTION = _get_env("SQUADBROWSER_NEXT_ACTION", required=False, default="")
-SQUADBROWSER_PAGE_URL = _get_env("SQUADBROWSER_PAGE_URL", required=False, default="https://squadbrowser.app/")
-SQUADBROWSER_LABEL = _get_env("SQUADBROWSER_LABEL", required=False, default="PSTN")
-# Обычно не нужно — action на squadbrowser отвечает и без сессии.
-# Если бот получает 401/403, скопируй заголовок Cookie из DevTools и вставь сюда как есть.
-SQUADBROWSER_COOKIE = _get_env("SQUADBROWSER_COOKIE", required=False, default="")
-SQUADBROWSER_ENABLED = bool(SQUADBROWSER_SERVER_ID and SQUADBROWSER_NEXT_ACTION)
-
-# Папка с флагами фракций: flags/afu.png, flags/rgf.png ...
 FLAGS_DIR = "flags"
 
 # ─────────────────────────────────────────────
@@ -92,14 +82,13 @@ log = logging.getLogger("nw-online-bot")
 # ─────────────────────────────────────────────
 
 intents = discord.Intents.default()
-intents.message_content = True  # нужно для команд !roster / !pstndebug
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ─────────────────────────────────────────────
 #  ГЕНЕРАЦИЯ PNG С ОНЛАЙНОМ
 # ─────────────────────────────────────────────
 
-# Цвета
 C_BG = (15, 15, 30)
 C_CARD = (22, 22, 45)
 C_BORDER = (0, 180, 140)
@@ -109,7 +98,6 @@ C_GREY = (160, 160, 180)
 C_GREEN = (0, 212, 140)
 C_RED_DOT = (220, 60, 60)
 
-# Размеры
 IMG_W = 700
 PAD = 24
 ROW_H = 36
@@ -123,9 +111,8 @@ SERVER_LABELS = {
     "AAS": "МИКС",
     "Spec Ops": "SPEC OPS",
     "Custom": "CUSTOM",
-    SQUADBROWSER_LABEL: SQUADBROWSER_LABEL.upper(),
+    PSTN_LABEL: PSTN_LABEL.upper(),
 }
-
 
 _FONT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PREFERRED_FONT = os.path.join(_FONT_DIR, "NotoSans-Cyrillic.ttf")
@@ -135,13 +122,6 @@ _symbol_font_cache: dict[int, ImageFont.FreeTypeFont] = {}
 
 
 def load_font(size: int):
-    """
-    Шрифт с поддержкой кириллицы. Приоритет:
-    1. Забандленный NotoSans-Cyrillic.ttf рядом с bot.py (работает в любом окружении, включая Railway)
-    2. Любой другой .ttf рядом с bot.py
-    3. Системные шрифты (если вдруг есть)
-    4. Дефолтный PIL-шрифт (НЕ поддерживает кириллицу — крайний случай)
-    """
     if size in _font_cache:
         return _font_cache[size]
 
@@ -182,10 +162,6 @@ def load_font(size: int):
 
 
 def load_symbol_font(size: int):
-    """
-    Запасной шрифт для символов/дингбатов, которых нет в основном шрифте
-    (например ❀ и подобные украшения в никах/тегах кланов).
-    """
     if size in _symbol_font_cache:
         return _symbol_font_cache[size]
     font = None
@@ -204,7 +180,6 @@ _cmap_cache: dict[str, set] = {}
 
 
 def _get_font_cmap(font_path: str) -> set:
-    """Множество кодпоинтов, реально поддерживаемых шрифтом (через таблицу cmap)."""
     if font_path in _cmap_cache:
         return _cmap_cache[font_path]
     codepoints: set = set()
@@ -225,11 +200,6 @@ def _font_has_glyph(font_path: str, ch: str) -> bool:
 
 
 def draw_text_mixed(draw: ImageDraw.ImageDraw, xy: tuple, text: str, size: int, fill, anchor=None):
-    """
-    Рисует текст, автоматически переключаясь на запасной шрифт символов
-    для символов, отсутствующих в основном (кириллическом) шрифте.
-    Не поддерживает произвольные anchor-режимы PIL — только левый верхний угол по x,y.
-    """
     main_font = load_font(size)
     sym_font = load_symbol_font(size)
     main_has = os.path.exists(_PREFERRED_FONT)
@@ -239,18 +209,6 @@ def draw_text_mixed(draw: ImageDraw.ImageDraw, xy: tuple, text: str, size: int, 
         font = main_font if use_main else sym_font
         draw.text((x, y), ch, font=font, fill=fill)
         x += draw.textlength(ch, font=font)
-
-
-def text_length_mixed(draw: ImageDraw.ImageDraw, text: str, size: int) -> float:
-    main_font = load_font(size)
-    sym_font = load_symbol_font(size)
-    main_has = os.path.exists(_PREFERRED_FONT)
-    total = 0.0
-    for ch in text:
-        use_main = _font_has_glyph(_PREFERRED_FONT, ch) if main_has else True
-        font = main_font if use_main else sym_font
-        total += draw.textlength(ch, font=font)
-    return total
 
 
 def load_flag(team_code: str, size: int):
@@ -263,7 +221,6 @@ def load_flag(team_code: str, size: int):
 
 
 def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
-    """Генерирует PNG-карточку с онлайном клана."""
     total = data.get("total_online", 0)
     servers = data.get("servers", {})
     now_msk = (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M МСК")
@@ -301,9 +258,7 @@ def generate_online_image(data: dict, game_state: dict | None = None) -> bytes:
     img = Image.new("RGB", (IMG_W, img_h), C_BG)
     draw = ImageDraw.Draw(img)
 
-    fn_title = load_font(18)
     fn_server = load_font(15)
-    fn_player = load_font(14)
     fn_small = load_font(11)
     fn_count = load_font(13)
 
@@ -413,24 +368,9 @@ _online_message_id: dict[int, int] = {}
 _online_loop_started = False
 _game_state: dict[str, dict] = {}
 _map_state: dict[str, str] = {}
-# Копится по мере опросов sqstat: "голые" ники (без тега клана, в нижнем регистре)
-# всех когда-либо увиденных участников клана. Используется, чтобы узнавать своих
-# на сервере без sqstat (PSTN) — там нет тега, но ник обычно тот же самый.
-# ВАЖНО: sqstat не отдаёт настоящий SteamID64 в clan.php (там просто порядковый
-# номер слота вида "54"), поэтому матчинг идёт по нику, а не по ID.
 _known_clan_names: set[str] = set()
 
-# Кириллица и латиница часто визуально неотличимы (А/A, Е/E, Р/P и т.д.) — люди
-# copy-paste'ят тег откуда попало, и в никах гуляют вперемешку разные варианты
-# одного и того же тега. Нормализуем такие "омоглифы" к латинице ПЕРЕД сравнением,
-# чтобы не пришлось вручную перечислять каждую комбинацию в CLAN_TAG_FILTER.
-_HOMOGLYPH_MAP = str.maketrans(
-    "АВЕКМНОРСТУХаеорсух",
-    "ABEKMHOPCTYXaeopcyx",
-)
-# Декоративные "цветочки", которые часто оборачивают теги — если в CLAN_TAG_FILTER
-# перечислен не тот вариант символа, всё равно срежем его как обрамляющий мусор.
-_DECOR_CHARS = "❀✿✾✽✼✻✺✹✸❁❃❋"
+_HOMOGLYPH_MAP = str.maketrans("АВЕКМНОРСТУХаеорсух", "ABEKMHOPCTYXaeopcyx")
 
 
 def _normalize_homoglyphs(s: str) -> str:
@@ -438,28 +378,37 @@ def _normalize_homoglyphs(s: str) -> str:
 
 
 def _has_clan_tag(name: str) -> bool:
-    """Проверяет, есть ли в нике буквально один из CLAN_TAGS — с учётом омоглифов (А/A и т.п.)."""
     if not CLAN_TAGS:
         return False
     norm_name = _normalize_homoglyphs(name).upper()
     return any(_normalize_homoglyphs(tag).upper() in norm_name for tag in CLAN_TAGS)
 
 
+def _is_letter(ch: str) -> bool:
+    return unicodedata.category(ch).startswith("L")
+
+
+def _has_letter(s: str) -> bool:
+    return any(_is_letter(ch) for ch in s)
+
+
+def _keep_letters_digits_spaces(s: str) -> str:
+    return "".join(ch for ch in s if _is_letter(ch) or ch.isdigit() or ch.isspace())
+
+
 def _bare_name(name: str) -> str:
-    """
-    Убирает тег клана и обрамляющий мусор (скобки/разделители/цветочки-декорации),
-    чтобы сравнивать чистые ники. Кириллица/латиница нормализуется, так что
-    '✿A✿ stl' и '✿А✿ stl' (латинская и кириллическая A) дадут один результат.
-    """
     result = _normalize_homoglyphs(name)
     for tag in CLAN_TAGS:
         result = re.sub(re.escape(_normalize_homoglyphs(tag)), "", result, flags=re.IGNORECASE)
-    result = result.strip(" \t\r\n-_|[](){}:·•" + _DECOR_CHARS)
+
+    tokens = [t for t in result.split() if _has_letter(t)]
+    result = " ".join(tokens)
+    result = _keep_letters_digits_spaces(result)
+
     return result.strip().lower()
 
 
 def _log_roster_dump(chunk_size: int = 40):
-    """Пишет в лог весь текущий список известных ников клана — чтобы не лезть за этим в Discord-команду."""
     if not _known_clan_names:
         log.info("sqstat: ростер пуст — известных ников клана пока нет")
         return
@@ -478,23 +427,8 @@ SQSTAT_SERVER_MAP = {
     "11": "Custom",
 }
 
-_HEADERS_CLAN = {
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "X-Requested-With": "XMLHttpRequest",
-    "Origin": SQSTAT_BASE_URL,
-    "Referer": f"{SQSTAT_BASE_URL}/clan/{CLAN_ID}",
-    "User-Agent": "Mozilla/5.0",
-}
-_HEADERS_PUB = {
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": f"{SQSTAT_BASE_URL}/",
-    "User-Agent": "Mozilla/5.0",
-}
-
 
 async def _post_with_cookie(session: aiohttp.ClientSession, url: str, data: dict, headers: dict) -> str:
-    """sqstat иногда отдаёт JS-редирект с PHPSESID вместо JSON — повторяем запрос с куки."""
     async with session.post(url, data=data, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
         raw = await r.text()
     if "PHPSESID=" in raw and "document.cookie" in raw:
@@ -509,242 +443,131 @@ async def _post_with_cookie(session: aiohttp.ClientSession, url: str, data: dict
     return raw
 
 
-def _fix_mojibake(s: str) -> str:
-    """
-    squadbrowser иногда отдаёт кириллицу/эмодзи как UTF-8-байты, ошибочно
-    прочитанные как Windows-1252 (например 'ÐŸÐµÑ€Ð²Ñ‹Ð¹' вместо 'Первый').
-    Пытаемся откатить это обратно; если не получается — отдаём как есть
-    (единичные ники всё равно могут остаться повреждёнными — это баг на их стороне).
-    """
-    if not s:
-        return s
-    try:
-        fixed = s.encode("cp1252").decode("utf-8")
-        if fixed.count("Ð") < s.count("Ð") or fixed != s:
-            return fixed
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        pass
-    return s
-
-
-async def fetch_squadbrowser_live() -> dict | None:
-    """
-    Забирает live-данные сервера без sqstat (PSTN) через внутренний Next.js
-    Server Action сайта squadbrowser.app. Это не публичный API — Next-Action
-    хэш зашит в конкретную сборку их сайта и может измениться при редеплое.
-    Если бот вдруг перестал видеть этот сервер — скорее всего именно это,
-    нужно достать новый хэш из DevTools (см. .env.example) и обновить
-    SQUADBROWSER_NEXT_ACTION.
-    """
-    headers = {
-        "Content-Type": "text/plain;charset=UTF-8",
-        "Accept": "text/x-component",
-        "Next-Action": SQUADBROWSER_NEXT_ACTION,
-        "Next-Router-State-Tree": '["",{"children":["__PAGE__",{},null,null]},null,null,true]',
-        "Origin": "https://squadbrowser.app",
-        "Referer": SQUADBROWSER_PAGE_URL,
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
-        ),
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
+async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, clan_id: str, default_srv_label: str = None) -> dict:
+    """Запрашивает ростер, сервера и игроков с любого sqstat-сайта."""
+    headers_clan = {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": base_url,
+        "Referer": f"{base_url}/clan/{clan_id}",
+        "User-Agent": "Mozilla/5.0",
     }
-    if SQUADBROWSER_COOKIE:
-        headers["Cookie"] = SQUADBROWSER_COOKIE
+    headers_pub = {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"{base_url}/",
+        "User-Agent": "Mozilla/5.0",
+    }
 
-    payload = json.dumps([SQUADBROWSER_SERVER_ID])
+    result = {"players_by_server": {}, "roster_names": set()}
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                SQUADBROWSER_PAGE_URL, data=payload, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                raw = await resp.text()
-                if resp.status != 200:
-                    log.warning(
-                        f"fetch_squadbrowser_live: HTTP {resp.status} — возможно, устарел "
-                        f"Next-Action хэш или нужны куки (SQUADBROWSER_COOKIE). Ответ: {raw[:200]!r}"
-                    )
-    except Exception as e:
-        log.error(f"fetch_squadbrowser_live: сетевая ошибка: {e}")
-        return None
-
-    # Ответ — построчный RSC-стрим Next.js: "0:{...}\n1:{...ok...}\n"
-    payload_json = None
-    for line in raw.splitlines():
-        if ":" not in line:
-            continue
-        _, _, rest = line.partition(":")
-        rest = rest.strip()
-        if not rest.startswith('{"ok"'):
-            continue
-        try:
-            payload_json = json.loads(rest)
-            break
-        except json.JSONDecodeError:
-            continue
-
-    if not payload_json or not payload_json.get("ok"):
-        log.warning(
-            f"fetch_squadbrowser_live: неожиданный формат ответа, возможно устарел "
-            f"Next-Action хэш (первые 200 симв.): {raw[:200]!r}"
+        raw_clan = await _post_with_cookie(
+            session, f"{base_url}/ajax/clan.php",
+            {"clan_id": clan_id, "action": "list"}, headers_clan,
         )
-        return None
+        clan_data = json.loads(raw_clan)
 
-    live = (payload_json.get("data") or {}).get("live") or {}
-    if not live:
-        return None  # сервер офлайн или нет данных
+        # 1. Пополнение известных ников
+        for p in clan_data.get("players", []):
+            if isinstance(p, dict):
+                raw_name = (p.get("name") or "").strip()
+                bare = _bare_name(raw_name)
+                if bare:
+                    result["roster_names"].add(bare)
 
-    cur_map = live.get("current_map", "") or ""
-    srv_online = live.get("current_players", 0) or 0
+        # 2. Получение статы серверов (карта, суммарный онлайн)
+        server_info = {}
+        try:
+            raw_pub = await _post_with_cookie(
+                session, f"{base_url}/ajax/public.php",
+                {"action": "statistics"}, headers_pub,
+            )
+            pub_data = json.loads(raw_pub)
+            for sid, sinfo in pub_data.get("servers", {}).items():
+                if isinstance(sinfo, dict):
+                    server_info[str(sid)] = {
+                        "map": sinfo.get("map", ""),
+                        "online": int(sinfo.get("online", 0) or 0),
+                    }
+        except Exception as e:
+            log.warning(f"{base_url} public.php error: {e}")
 
-    players = []
-    for p in live.get("players", []):
-        name = _fix_mojibake((p.get("display_name") or "").strip())
-        if not name:
-            continue
-        steam_id = str(p.get("steam_id", "") or "")
-        team = (p.get("team") or "").strip() or "Unknown"
-        players.append({
-            "name": name,
-            "team": team,
-            "cur_map": cur_map,
-            "srv_online": srv_online,
-            "steam_id": steam_id,
-        })
+        # 3. Парсинг текущего онлайна
+        for srv_id, srv_data in clan_data.get("servers", {}).items():
+            if not srv_data or isinstance(srv_data, list):
+                continue
 
-    return {"cur_map": cur_map, "srv_online": srv_online, "players": players}
+            srv_name = default_srv_label or SQSTAT_SERVER_MAP.get(str(srv_id), "Custom")
+            info = server_info.get(str(srv_id), {})
+            cur_map = info.get("map", "")
+            srv_online = info.get("online", 0)
+
+            for player_id, player_data in srv_data.items():
+                if not isinstance(player_data, dict):
+                    continue
+                name = player_data.get("name", "").strip()
+                if not name or len(name) >= 50:
+                    continue
+
+                name_bare = _bare_name(name)
+                if name_bare:
+                    result["roster_names"].add(name_bare)
+
+                team_code = player_data.get("team", "")
+                result["players_by_server"].setdefault(srv_name, []).append({
+                    "name": name,
+                    "team": team_code,
+                    "cur_map": cur_map,
+                    "srv_online": srv_online,
+                    "bare_name": name_bare,
+                })
+
+    except Exception as e:
+        log.error(f" Ошибка парсинга sqstat ({base_url}): {e}")
+
+    return result
 
 
 async def fetch_online_data() -> dict | None:
-    """
-    Парсит онлайн клана напрямую с sqstat (без стороннего сервера):
-    1. ajax/clan.php action=list — игроки клана по серверам
-    2. ajax/public.php action=statistics — текущая карта и онлайн каждого сервера
-    Возвращает структуру в формате, ожидаемом generate_online_image().
-    """
-    grouped: dict[str, list] = {"Invasion": [], "AAS": [], "Spec Ops": [], "Custom": []}
+    """Парсит оба ресурса sqstat (Основной и PSTN) параллельно и объединяет выдачу."""
+    grouped: dict[str, list] = {"Invasion": [], "AAS": [], "Spec Ops": [], "Custom": [], PSTN_LABEL: []}
 
     try:
         async with aiohttp.ClientSession() as session:
-            raw_clan = await _post_with_cookie(
-                session, f"{SQSTAT_BASE_URL}/ajax/clan.php",
-                {"clan_id": CLAN_ID, "action": "list"}, _HEADERS_CLAN,
-            )
-            clan_data = json.loads(raw_clan)
+            # Запускаем одновременно оба запроса
+            main_task = _fetch_sqstat_instance(session, SQSTAT_BASE_URL, CLAN_ID)
+            pstn_task = _fetch_sqstat_instance(session, PSTN_SQSTAT_BASE_URL, PSTN_CLAN_ID, default_srv_label=PSTN_LABEL)
 
-            # Полный ростер клана (панелька) — все участники, независимо от того,
-            # онлайн они сейчас или нет. Отдельное поле в том же ответе clan.php,
-            # не путать с data["servers"] (там только те, кто сейчас в игре).
-            roster_total = 0
-            for p in clan_data.get("players", []):
-                if not isinstance(p, dict):
-                    continue
-                raw_name = (p.get("name") or "").strip()
-                if not raw_name:
-                    continue
-                bare = _bare_name(raw_name)
-                if bare:
-                    _known_clan_names.add(bare)
-                    roster_total += 1
+            main_res, pstn_res = await asyncio.gather(main_task, pstn_task)
 
-            if roster_total == 0:
-                log.warning(
-                    f"sqstat: clan_data['players'] пуст или отсутствует (ключи в ответе: "
-                    f"{list(clan_data.keys())}) — полный ростер не загружен, "
-                    f"известные ники будут копиться только из тех, кто сейчас в игре"
-                )
-            log.info(f"sqstat: полный ростер клана — {roster_total} ников, известно всего: {len(_known_clan_names)}")
+            # Объединяем полученный ростер игроков
+            _known_clan_names.update(main_res["roster_names"])
+            _known_clan_names.update(pstn_res["roster_names"])
             _log_roster_dump()
 
-            server_info: dict[str, dict] = {}
-            try:
-                raw_pub = await _post_with_cookie(
-                    session, f"{SQSTAT_BASE_URL}/ajax/public.php",
-                    {"action": "statistics"}, _HEADERS_PUB,
-                )
-                pub_data = json.loads(raw_pub)
-                for sid, sinfo in pub_data.get("servers", {}).items():
-                    if isinstance(sinfo, dict):
-                        server_info[str(sid)] = {
-                            "map": sinfo.get("map", ""),
-                            "online": int(sinfo.get("online", 0) or 0),
-                        }
-            except Exception as e:
-                log.warning(f"public.php (карты/онлайн серверов): {e}")
-
-            raw_total = 0
-            matched_total = 0
-            seen_team_codes: set[str] = set()
-
-            for srv_id, srv_data in clan_data.get("servers", {}).items():
-                if not srv_data or isinstance(srv_data, list):
-                    continue
-
-                srv_name = SQSTAT_SERVER_MAP.get(str(srv_id), "Custom")
-                info = server_info.get(str(srv_id), {})
-                cur_map = info.get("map", "")
-                srv_online = info.get("online", 0)
-
-                for player_id, player_data in srv_data.items():
-                    if not isinstance(player_data, dict):
-                        continue
-                    name = player_data.get("name", "").strip()
-                    if not name or len(name) >= 50:
-                        continue
-                    raw_total += 1
-                    name_bare = _bare_name(name)
+            # Функция фильтрации игроков по тегам или по ростеру
+            def filter_players(players_list):
+                matched = []
+                for p in players_list:
+                    name = p["name"]
+                    bare = p["bare_name"]
                     is_tagged = _has_clan_tag(name)
-                    is_in_roster = bool(name_bare) and name_bare in _known_clan_names
-                    if CLAN_TAGS and not (is_tagged or is_in_roster):
-                        continue
-                    matched_total += 1
-                    team_code = player_data.get("team", "")
-                    if team_code:
-                        seen_team_codes.add(str(team_code))
+                    is_in_roster = bool(bare) and bare in _known_clan_names
+                    if not CLAN_TAGS or is_tagged or is_in_roster:
+                        matched.append(p)
+                return matched
 
-                    bare = name_bare
-                    if bare:
-                        _known_clan_names.add(bare)
+            # Формируем результаты основной группы
+            for srv_name, players in main_res["players_by_server"].items():
+                grouped.setdefault(srv_name, []).extend(filter_players(players))
 
-                    grouped.setdefault(srv_name, []).append({
-                        "name": name,
-                        "team": team_code,
-                        "cur_map": cur_map,
-                        "srv_online": srv_online,
-                        "bare_name": bare,
-                    })
-
-            log.info(
-                f"sqstat: всего игроков на серверах {raw_total}, прошло фильтр тегов {matched_total}, "
-                f"коды фракций в текущей выдаче: {sorted(seen_team_codes)}, "
-                f"известно ников клана всего: {len(_known_clan_names)}"
-            )
-
-            if SQUADBROWSER_ENABLED:
-                try:
-                    pstn = await fetch_squadbrowser_live()
-                    if pstn:
-                        matched_pstn = []
-                        for p in pstn["players"]:
-                            p_bare = _bare_name(p["name"])
-                            is_known = bool(p_bare) and p_bare in _known_clan_names
-                            is_tagged = _has_clan_tag(p["name"])
-                            if is_known or is_tagged:
-                                matched_pstn.append(p)
-                        log.info(
-                            f"{SQUADBROWSER_LABEL} (squadbrowser): игроков на сервере {len(pstn['players'])}, "
-                            f"опознано как свои {len(matched_pstn)} (известно ников клана: {len(_known_clan_names)})"
-                        )
-                        grouped[SQUADBROWSER_LABEL] = matched_pstn
-                except Exception as e:
-                    log.error(f"squadbrowser: {e}", exc_info=True)
+            # Формируем результаты PSTN группы
+            for srv_name, players in pstn_res["players_by_server"].items():
+                grouped.setdefault(srv_name, []).extend(filter_players(players))
 
     except Exception as e:
-        log.error(f"fetch_online_data (sqstat scrape): {e}", exc_info=True)
+        log.error(f"fetch_online_data error: {e}", exc_info=True)
         return None
 
     total_online = sum(len(v) for v in grouped.values())
@@ -765,7 +588,6 @@ def is_seed_map(map_name: str) -> bool:
 
 
 def detect_game_changes(data: dict) -> list[str]:
-    """Обновляет _game_state/_map_state, возвращает список серверов где засид закончился."""
     now = datetime.now(timezone.utc) + timedelta(hours=3)
     servers = data.get("servers", {})
     seed_ended: list[str] = []
@@ -879,7 +701,6 @@ async def start_online_loop():
 
 
 def _chunk_text(text: str, limit: int = 1900):
-    """Режет длинный текст на куски, безопасные для лимита сообщений Discord (2000 симв.)."""
     lines = text.split("\n")
     chunks, cur = [], ""
     for line in lines:
@@ -894,7 +715,7 @@ def _chunk_text(text: str, limit: int = 1900):
 
 @bot.command(name="roster")
 async def cmd_roster(ctx: commands.Context):
-    """Показывает все ники, которые бот сейчас считает участниками клана (после снятия тега)."""
+    """Показывает все ники, которые бот сейчас считает участниками клана."""
     if not _known_clan_names:
         await ctx.send("Пока не знаю ни одного ника клана — подожди следующего опроса sqstat.")
         return
@@ -905,34 +726,6 @@ async def cmd_roster(ctx: commands.Context):
     for i, chunk in enumerate(_chunk_text(body, 1900 - len(header) - len(footer))):
         text = f"{header}{chunk}{footer}" if i == 0 else f"```\n{chunk}\n```"
         await ctx.send(text)
-
-
-@bot.command(name="pstndebug")
-async def cmd_pstn_debug(ctx: commands.Context):
-    """Свежий запрос к squadbrowser + построчный разбор: кто опознан своим, кто нет и почему."""
-    if not SQUADBROWSER_ENABLED:
-        await ctx.send("PSTN/squadbrowser не настроен (нет SQUADBROWSER_SERVER_ID / SQUADBROWSER_NEXT_ACTION).")
-        return
-
-    await ctx.send("Опрашиваю squadbrowser...")
-    pstn = await fetch_squadbrowser_live()
-    if not pstn:
-        await ctx.send("Не удалось получить данные с squadbrowser (см. логи Railway — скорее всего протух Next-Action).")
-        return
-
-    lines = [f"Карта: {pstn['cur_map']}  Онлайн: {pstn['srv_online']}  Игроков в списке: {len(pstn['players'])}", ""]
-    for p in pstn["players"]:
-        p_bare = _bare_name(p["name"])
-        is_known = bool(p_bare) and p_bare in _known_clan_names
-        is_tagged = _has_clan_tag(p["name"])
-        matched = is_known or is_tagged
-        mark = "✅" if matched else "  "
-        reason = "roster" if is_known else ("tag" if is_tagged else "-")
-        lines.append(f"{mark} {p['name']!r:30} -> bare={p_bare!r:20} matched={matched} ({reason})")
-
-    body = "\n".join(lines)
-    for chunk in _chunk_text(body, 1900):
-        await ctx.send(f"```\n{chunk}\n```")
 
 
 # ─────────────────────────────────────────────
