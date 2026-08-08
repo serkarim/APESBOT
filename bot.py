@@ -17,6 +17,7 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
+import aiosqlite
 import discord
 from discord.ext import commands
 from PIL import Image, ImageDraw, ImageFont
@@ -63,6 +64,23 @@ _seed_role = os.environ.get("SEED_ALERT_ROLE_ID")
 SEED_ALERT_CHANNEL_ID = int(_seed_channel) if _seed_channel else None
 SEED_ALERT_ROLE_ID = int(_seed_role) if _seed_role else None
 SEED_MAP_KEYWORDS = ["seed", "сид"]
+
+# ─────────────────────────────────────────────
+# Система увалов (отпуск/инактив)
+# ─────────────────────────────────────────────
+# Канал, где висит сообщение с кнопками "Уйти в увал" / "Отменить" (для игроков)
+_leave_channel = os.environ.get("LEAVE_CHANNEL_ID")
+LEAVE_CHANNEL_ID = int(_leave_channel) if _leave_channel else None
+# Канал, куда бот постит карточки увалов (для офицерского состава)
+_officer_leave_channel = os.environ.get("OFFICER_LEAVE_CHANNEL_ID")
+OFFICER_LEAVE_CHANNEL_ID = int(_officer_leave_channel) if _officer_leave_channel else None
+
+# Файл SQLite-базы для хранения увалов. ВАЖНО: на Railway по умолчанию файловая
+# система эфемерна между РЕДЕПЛОЯМИ (обычные рестарты процесса файл не трогают).
+# Чтобы увалы переживали и редеплои — подключи Railway Volume и примонтируй его
+# на путь из LEAVES_DB_PATH (например /data), иначе база будет пересоздаваться
+# с нуля при каждом новом деплое.
+LEAVES_DB_PATH = _get_env("LEAVES_DB_PATH", required=False, default="leaves.db")
 
 FLAGS_DIR = "flags"
 
@@ -112,6 +130,9 @@ SERVER_LABELS = {
     "Spec Ops": "SPEC OPS",
     "Custom": "CUSTOM",
     PSTN_LABEL: PSTN_LABEL.upper(),
+    f"{PSTN_LABEL} 1": f"{PSTN_LABEL.upper()} 1",
+    f"{PSTN_LABEL} 2": f"{PSTN_LABEL.upper()} 2",
+    f"{PSTN_LABEL} 3": f"{PSTN_LABEL.upper()} 3",
 }
 
 _FONT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -443,7 +464,7 @@ async def _post_with_cookie(session: aiohttp.ClientSession, url: str, data: dict
     return raw
 
 
-async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, clan_id: str, default_srv_label: str = None) -> dict:
+async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, clan_id: str, default_srv_prefix: str = None) -> dict:
     """Запрашивает ростер, сервера и игроков с любого sqstat-сайта."""
     headers_clan = {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -494,13 +515,19 @@ async def _fetch_sqstat_instance(session: aiohttp.ClientSession, base_url: str, 
             log.warning(f"{base_url} public.php error: {e}")
 
         # 3. Парсинг текущего онлайна
+        active_servers = [sid for sid, sdata in clan_data.get("servers", {}).items() if sdata and not isinstance(sdata, list)]
+        multiple_servers = len(active_servers) > 1
+
         for srv_id, srv_data in clan_data.get("servers", {}).items():
             if not srv_data or isinstance(srv_data, list):
                 continue
 
-            # ИСПРАВЛЕНИЕ: если задан метка по умолчанию (для PSTN), используем её приоритетно
-            if default_srv_label:
-                srv_name = default_srv_label
+            # Если парсим PSTN: разделяем на PSTN 1, PSTN 2 (если их несколько)
+            if default_srv_prefix:
+                if multiple_servers:
+                    srv_name = f"{default_srv_prefix} {srv_id}"
+                else:
+                    srv_name = default_srv_prefix
             else:
                 srv_name = SQSTAT_SERVER_MAP.get(str(srv_id), "Custom")
 
@@ -733,6 +760,345 @@ async def cmd_roster(ctx: commands.Context):
 
 
 # ─────────────────────────────────────────────
+#  СИСТЕМА УВАЛОВ (ОТПУСК/ИНАКТИВ) — БД
+# ─────────────────────────────────────────────
+
+# Кэш активных увалов в памяти для быстрых проверок (user_id -> запись из БД).
+# Источник истины — SQLite (LEAVES_DB_PATH), кэш просто зеркалит его и грузится
+# заново из БД при каждом старте бота (см. on_ready), так что рестарты процесса
+# ничего не теряют. Теряется только при полном редеплое БЕЗ примонтированного
+# Railway Volume — см. комментарий у LEAVES_DB_PATH.
+_active_leaves: dict[int, dict] = {}
+
+
+async def db_init():
+    async with aiosqlite.connect(LEAVES_DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS leaves (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                user_name TEXT,
+                days INTEGER NOT NULL,
+                reason TEXT,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                officer_message_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'active',
+                added_by TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_leaves_user_status ON leaves(user_id, status)")
+        await db.commit()
+    log.info(f"БД увалов инициализирована: {LEAVES_DB_PATH}")
+
+
+async def db_add_leave(user_id: int, user_name: str, days: int, reason: str,
+                        officer_message_id: int | None, added_by: str = "self") -> int:
+    started = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(LEAVES_DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO leaves (user_id, user_name, days, reason, started_at, officer_message_id, status, added_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'active', ?)",
+            (user_id, user_name, days, reason, started, officer_message_id, added_by),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def db_cancel_leave(user_id: int) -> dict | None:
+    ended = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(LEAVES_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM leaves WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1", (user_id,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        await db.execute("UPDATE leaves SET status = 'cancelled', ended_at = ? WHERE id = ?", (ended, row["id"]))
+        await db.commit()
+        return dict(row)
+
+
+async def db_get_active_leaves() -> list[dict]:
+    async with aiosqlite.connect(LEAVES_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM leaves WHERE status = 'active' ORDER BY started_at")
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def db_get_active_leave(user_id: int) -> dict | None:
+    async with aiosqlite.connect(LEAVES_DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM leaves WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1", (user_id,)
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def _load_active_leaves_cache():
+    """Вызывается при старте бота — подтягивает активные увалы из БД в память."""
+    _active_leaves.clear()
+    for row in await db_get_active_leaves():
+        _active_leaves[row["user_id"]] = row
+    log.info(f"Увалы: загружено из БД активных записей — {len(_active_leaves)}")
+
+
+def _leave_embed(member: discord.Member | discord.User, days: int, reason: str,
+                  cancelled: bool = False, migrated: bool = False) -> discord.Embed:
+    if cancelled:
+        title = "✅ Увал завершён"
+        color = discord.Color.green()
+    elif migrated:
+        title = "🌴 Увал (перенесён вручную)"
+        color = discord.Color.gold()
+    else:
+        title = "🌴 Новый увал"
+        color = discord.Color.orange()
+    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Игрок", value=member.mention, inline=True)
+    embed.add_field(name="Дней в инактиве", value=str(days), inline=True)
+    embed.add_field(name="Причина", value=reason or "—", inline=False)
+    embed.set_footer(text=f"ID: {member.id}")
+    return embed
+
+
+class LeaveModal(discord.ui.Modal, title="Уйти в увал"):
+    days = discord.ui.TextInput(
+        label="Сколько дней в инактиве",
+        placeholder="Например: 7",
+        required=True,
+        max_length=4,
+    )
+    reason = discord.ui.TextInput(
+        label="Причина",
+        style=discord.TextStyle.paragraph,
+        placeholder="Коротко опиши причину увала",
+        required=True,
+        max_length=500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw_days = self.days.value.strip()
+        if not raw_days.isdigit() or not (0 < int(raw_days) <= 365):
+            await interaction.response.send_message(
+                "Количество дней должно быть числом от 1 до 365. Попробуй ещё раз через кнопку.",
+                ephemeral=True,
+            )
+            return
+        days_val = int(raw_days)
+        reason_val = self.reason.value.strip()
+
+        member = interaction.user
+        embed = _leave_embed(member, days_val, reason_val)
+
+        officer_msg_id = None
+        if OFFICER_LEAVE_CHANNEL_ID:
+            officer_channel = bot.get_channel(OFFICER_LEAVE_CHANNEL_ID)
+            if officer_channel:
+                try:
+                    msg = await officer_channel.send(embed=embed)
+                    officer_msg_id = msg.id
+                except Exception as e:
+                    log.error(f"Не удалось отправить карточку увала офицерам: {e}")
+            else:
+                log.warning(f"OFFICER_LEAVE_CHANNEL_ID={OFFICER_LEAVE_CHANNEL_ID} — канал не найден")
+        else:
+            log.warning("OFFICER_LEAVE_CHANNEL_ID не задан — карточка увала никуда не отправлена")
+
+        leave_id = await db_add_leave(member.id, str(member), days_val, reason_val, officer_msg_id, added_by="self")
+        _active_leaves[member.id] = {
+            "id": leave_id,
+            "user_id": member.id,
+            "user_name": str(member),
+            "days": days_val,
+            "reason": reason_val,
+            "officer_message_id": officer_msg_id,
+            "status": "active",
+        }
+
+        await interaction.response.send_message(
+            f"Увал оформлен на {days_val} дн. Хорошего отдыха! Вернёшься — жми «Отменить» на этом же сообщении.",
+            ephemeral=True,
+        )
+        log.info(f"Увал: {member} ({member.id}) — {days_val} дн., причина: {reason_val!r}")
+
+
+class LeaveView(discord.ui.View):
+    """Постоянные кнопки. custom_id фиксированный, чтобы работать и после рестарта бота."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Уйти в увал", style=discord.ButtonStyle.primary, emoji="🌴", custom_id="nw_leave_go")
+    async def go_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id in _active_leaves:
+            await interaction.response.send_message(
+                "У тебя уже оформлен увал. Сначала нажми «Отменить», если хочешь оформить новый.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(LeaveModal())
+
+    @discord.ui.button(label="Отменить", style=discord.ButtonStyle.secondary, emoji="↩️", custom_id="nw_leave_cancel")
+    async def cancel_leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        _active_leaves.pop(interaction.user.id, None)
+        leave = await db_cancel_leave(interaction.user.id)
+        if not leave:
+            await interaction.response.send_message("У тебя сейчас нет активного увала.", ephemeral=True)
+            return
+
+        if OFFICER_LEAVE_CHANNEL_ID and leave.get("officer_message_id"):
+            officer_channel = bot.get_channel(OFFICER_LEAVE_CHANNEL_ID)
+            if officer_channel:
+                try:
+                    msg = await officer_channel.fetch_message(leave["officer_message_id"])
+                    updated = _leave_embed(interaction.user, leave["days"], leave["reason"], cancelled=True)
+                    await msg.edit(embed=updated)
+                except discord.NotFound:
+                    pass
+                except Exception as e:
+                    log.warning(f"Не удалось обновить карточку увала при отмене: {e}")
+
+        await interaction.response.send_message("Увал отменён, с возвращением! 👋", ephemeral=True)
+        log.info(f"Увал отменён: {interaction.user} ({interaction.user.id})")
+
+
+@bot.command(name="leavepanel")
+@commands.has_permissions(manage_guild=True)
+async def cmd_leave_panel(ctx: commands.Context):
+    """Публикует (или переpubликует) панель с кнопками увала в LEAVE_CHANNEL_ID."""
+    if not LEAVE_CHANNEL_ID:
+        await ctx.send("LEAVE_CHANNEL_ID не задан в переменных окружения — некуда постить панель.")
+        return
+    channel = bot.get_channel(LEAVE_CHANNEL_ID)
+    if not channel:
+        await ctx.send(f"Канал LEAVE_CHANNEL_ID={LEAVE_CHANNEL_ID} не найден (бот туда не добавлен?).")
+        return
+
+    embed = discord.Embed(
+        title="🌴 Увал",
+        description=(
+            "Уходишь в отпуск от игры — нажми **Уйти в увал** и заполни форму "
+            "(сколько дней и причина). Офицерский состав увидит карточку с твоим ником и аватаркой.\n\n"
+            "Вернулся раньше срока — жми **Отменить**."
+        ),
+        color=discord.Color.blurple(),
+    )
+    await channel.send(embed=embed, view=LeaveView())
+    if channel.id != ctx.channel.id:
+        await ctx.send(f"Готово, панель опубликована в {channel.mention}.")
+
+
+@cmd_leave_panel.error
+async def cmd_leave_panel_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("Эта команда доступна только тем, у кого есть право «Управление сервером».")
+    else:
+        log.error(f"cmd_leave_panel: {error}", exc_info=True)
+
+
+@bot.command(name="addleave")
+@commands.has_permissions(manage_guild=True)
+async def cmd_add_leave(ctx: commands.Context, member: discord.Member, days: int, *, reason: str):
+    """
+    Миграция/ручное добавление увала офицером за игрока.
+    Использование: !addleave @Игрок 14 причина текстом до конца строки
+    """
+    if not (0 < days <= 365):
+        await ctx.send("Количество дней должно быть от 1 до 365.")
+        return
+    if member.id in _active_leaves:
+        await ctx.send(f"У {member.mention} уже есть активный увал в системе — сначала `!removeleave` его.")
+        return
+
+    embed = _leave_embed(member, days, reason, migrated=True)
+    officer_msg_id = None
+    if OFFICER_LEAVE_CHANNEL_ID:
+        officer_channel = bot.get_channel(OFFICER_LEAVE_CHANNEL_ID)
+        if officer_channel:
+            try:
+                msg = await officer_channel.send(embed=embed)
+                officer_msg_id = msg.id
+            except Exception as e:
+                log.error(f"Не удалось отправить карточку увала (миграция): {e}")
+
+    leave_id = await db_add_leave(member.id, str(member), days, reason, officer_msg_id, added_by=str(ctx.author))
+    _active_leaves[member.id] = {
+        "id": leave_id,
+        "user_id": member.id,
+        "user_name": str(member),
+        "days": days,
+        "reason": reason,
+        "officer_message_id": officer_msg_id,
+        "status": "active",
+    }
+    await ctx.send(f"Увал для {member.mention} добавлен ({days} дн., перенесено вручную).")
+    log.info(f"Увал добавлен вручную ({ctx.author}): {member} ({member.id}) — {days} дн., причина: {reason!r}")
+
+
+@bot.command(name="removeleave")
+@commands.has_permissions(manage_guild=True)
+async def cmd_remove_leave(ctx: commands.Context, member: discord.Member):
+    """Снимает увал с игрока за него (если сам не может/не хочет нажать кнопку)."""
+    _active_leaves.pop(member.id, None)
+    leave = await db_cancel_leave(member.id)
+    if not leave:
+        await ctx.send(f"У {member.mention} нет активного увала.")
+        return
+
+    if OFFICER_LEAVE_CHANNEL_ID and leave.get("officer_message_id"):
+        officer_channel = bot.get_channel(OFFICER_LEAVE_CHANNEL_ID)
+        if officer_channel:
+            try:
+                msg = await officer_channel.fetch_message(leave["officer_message_id"])
+                updated = _leave_embed(member, leave["days"], leave["reason"], cancelled=True)
+                await msg.edit(embed=updated)
+            except discord.NotFound:
+                pass
+            except Exception as e:
+                log.warning(f"Не удалось обновить карточку увала при снятии: {e}")
+
+    await ctx.send(f"Увал для {member.mention} снят.")
+    log.info(f"Увал снят вручную ({ctx.author}): {member} ({member.id})")
+
+
+@bot.command(name="activeleaves")
+@commands.has_permissions(manage_guild=True)
+async def cmd_active_leaves(ctx: commands.Context):
+    """Список всех активных увалов прямо из БД."""
+    rows = await db_get_active_leaves()
+    if not rows:
+        await ctx.send("Активных увалов нет.")
+        return
+    lines = []
+    for r in rows:
+        started = r["started_at"][:10] if r.get("started_at") else "?"
+        lines.append(f"<@{r['user_id']}> — {r['days']} дн., с {started}, причина: {r['reason']}")
+    body = "\n".join(lines)
+    for chunk in _chunk_text(body, 1900):
+        await ctx.send(chunk)
+
+
+for _cmd in (cmd_add_leave, cmd_remove_leave, cmd_active_leaves):
+    @_cmd.error
+    async def _leave_cmd_error(ctx: commands.Context, error: commands.CommandError):
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("Эта команда доступна только тем, у кого есть право «Управление сервером».")
+        elif isinstance(error, commands.MemberNotFound):
+            await ctx.send("Не нашёл такого участника — упомяни его через @.")
+        elif isinstance(error, commands.BadArgument):
+            await ctx.send("Проверь аргументы команды, например: `!addleave @Игрок 14 причина`.")
+        elif isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send("Не хватает аргументов, например: `!addleave @Игрок 14 причина`.")
+        else:
+            log.error(f"leave command error: {error}", exc_info=True)
+
+
+# ─────────────────────────────────────────────
 #  СОБЫТИЯ БОТА
 # ─────────────────────────────────────────────
 
@@ -741,6 +1107,16 @@ async def cmd_roster(ctx: commands.Context):
 async def on_ready():
     log.info(f"Бот запущен: {bot.user} ({bot.user.id})")
     log.info(f"Фильтр тегов клана: {CLAN_TAGS}")
+    bot.add_view(LeaveView())  # чтобы кнопки увала работали и после рестарта бота
+    await db_init()
+    await _load_active_leaves_cache()
+    if LEAVE_CHANNEL_ID and OFFICER_LEAVE_CHANNEL_ID:
+        log.info(f"Увалы: канал игроков {LEAVE_CHANNEL_ID}, канал офицеров {OFFICER_LEAVE_CHANNEL_ID}")
+    else:
+        log.warning(
+            "Увалы: не заданы LEAVE_CHANNEL_ID и/или OFFICER_LEAVE_CHANNEL_ID — "
+            "система увалов не будет работать, пока обе переменные не заданы"
+        )
     asyncio.create_task(start_online_loop())
 
 
