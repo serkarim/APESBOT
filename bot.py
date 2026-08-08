@@ -568,7 +568,7 @@ async def fetch_online_data() -> dict | None:
         async with aiohttp.ClientSession() as session:
             # Запускаем одновременно оба запроса
             main_task = _fetch_sqstat_instance(session, SQSTAT_BASE_URL, CLAN_ID)
-            pstn_task = _fetch_sqstat_instance(session, PSTN_SQSTAT_BASE_URL, PSTN_CLAN_ID, default_srv_label=PSTN_LABEL)
+            pstn_task = _fetch_sqstat_instance(session, PSTN_SQSTAT_BASE_URL, PSTN_CLAN_ID, default_srv_prefix=PSTN_LABEL)
 
             main_res, pstn_res = await asyncio.gather(main_task, pstn_task)
 
